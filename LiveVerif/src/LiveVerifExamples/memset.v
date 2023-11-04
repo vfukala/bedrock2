@@ -28,16 +28,7 @@ Derive memset SuchThat (fun_correct! memset) As memset_ok.                      
   while (i < n) /* decreases (n ^- i) */ {                                 /**. .**/
     store8(a + i, b);                                                      /**. .**/
     i = i + 1;                                                             /**. .**/
-  }                                                                        /**.
-
-  (* TODO in series of List.app, try to merge each pair of two adjacent lists *)
-  unfold List.repeatz. subst i.
-  replace (Z.to_nat \[i' ^+ /[1]]) with (Z.to_nat \[i'] + 1)%nat by steps.
-  rewrite List.repeat_app.
-  rewrite <- List.app_assoc.
-  replace (\[i' ^+ /[1]]) with (\[i'] + 1) by steps.
-  reflexivity.
-                                                                                .**/
+  }                                                                        /**. .**/
 }                                                                          /**.
 Qed.
 

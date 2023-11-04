@@ -12,6 +12,7 @@ Require Import coqutil.Tactics.fwd.
 Require Import coqutil.Tactics.ltac_list_ops.
 Require Import coqutil.Tactics.foreach_hyp.
 Require Import coqutil.Tactics.grepeat.
+Require Import coqutil.Tactics.pattern_tuple.
 Require Import coqutil.Datatypes.RecordSetters.
 Require Import bedrock2.Syntax bedrock2.Semantics.
 Require Import bedrock2.Lift1Prop.
@@ -31,6 +32,7 @@ Require Import bedrock2.PurifySep.
 Require Import bedrock2.PurifyHeapletwise.
 Require Import bedrock2.bottom_up_simpl.
 Require Import bedrock2.safe_implication.
+Require Import bedrock2.ZListEqProver.
 Require Import bedrock2.to_from_anybytes.
 Require Import bedrock2.syntactic_f_equal_with_ZnWords.
 Require Import coqutil.Tactics.ident_ops.
@@ -98,7 +100,7 @@ Inductive stepping: Type :=.
 Definition ready{P: Prop} := P.
 
 (* heapletwise- and word-aware lia, successor of ZnWords *)
-Ltac hwlia := zify_hyps; puri_simpli_zify_hyps accept_always; zify_goal; xlia zchecker.
+Ltac hwlia := zify_hyps; puri_simpli_zify_hyps true; zify_goal; xlia zchecker.
 
 Ltac2 Set bottom_up_simpl_sidecond_hook := fun _ => ltac1:(zify_goal; xlia zchecker).
 
@@ -246,13 +248,16 @@ Ltac destruct_ifs :=
 
 Import Ltac2.Ltac2. Set Default Proof Mode "Classic".
 
-Ltac2 default_simpl_in_hyps () :=
-  repeat (foreach_hyp (fun h t =>
-                         if Ident.starts_with @__ h then ()
-                         else bottom_up_simpl_in_hyp_of_type silent_if_no_progress h t));
-  try record.simp_hyps ().
+Ltac2 filtered_bottom_up_simpl_in_hyp_of_type(h: ident)(t: constr): unit :=
+  if Ident.starts_with @__ h then () else
+    lazy_match! t with
+    | functions_correct _ _ => ()
+    | _ => bottom_up_simpl_in_hyp_of_type silent_if_no_progress h t
+    end.
 
-Ltac default_simpl_in_hyps := ltac2:(default_simpl_in_hyps ()).
+Ltac bsimpl_in_hyps := ltac2:(foreach_hyp filtered_bottom_up_simpl_in_hyp_of_type).
+
+Ltac default_simpl_in_hyps := bsimpl_in_hyps; try record.simp_hyps.
 
 Ltac default_simpl_in_all :=
   default_simpl_in_hyps; bottom_up_simpl_in_goal_nop_ok; try record.simp_goal.
@@ -500,6 +505,35 @@ Ltac while cond measure0 :=
   | eauto with wf_of_type
   | start_loop_body ].
 
+Ltac dowhile measure0 :=
+  eapply (wp_dowhile measure0);
+  [ package_heapletwise_context
+  | eauto with wf_of_type
+  | start_loop_body ].
+
+Ltac dowhile_tailrec_use_functionpost ghosts0 measure0 :=
+  lazymatch goal with
+  | |- exec ?fs ?body ?t ?m ?l ?P =>
+      let P' := eval pattern measure0 in P in change (exec fs body t m l P')
+  end;
+  lazymatch goal with
+  | |- exec ?fs ?body ?t ?m ?l (?P ?v0) =>
+      let P' := pattern_tuple_in_term P ghosts0 in
+      change (exec fs body t m l (P' v0))
+  end;
+  eapply wp_dowhile_tailrec_use_functionpost with (g0 := ghosts0) (v0 := measure0);
+  [ eauto with wf_of_type
+  | package_heapletwise_context
+  | start_loop_body ].
+
+Ltac end_dowhile e :=
+  lazymatch goal with
+  (* from hypothesis of do-while lemma: *)
+  | |- exec _ _ ?t ?m ?l (fun t' m' l' =>
+     exists b, dexpr_bool3 _ _ ?condEvar _ _ _ _) => unify condEvar e
+  end;
+  close_block.
+
 Tactic Notation "new_ghosts" open_constr(g) := eexists g.
 
 Ltac is_local_var name :=
@@ -553,6 +587,9 @@ Ltac add_regular_snippet s :=
           end
       end
   | SWhile ?cond ?measure0 => while cond measure0
+  | SDo ?measure0 => dowhile measure0
+  | SDoTailrec ?ghosts0 ?measure0 => dowhile_tailrec_use_functionpost ghosts0 measure0
+  | SEndDo ?c => end_dowhile c
   | SStart => fail "SStart can only be used to start a function"
   | SEnd => close_block
   | SRet ?retexpr => ret retexpr
@@ -610,12 +647,6 @@ Ltac cleanup_step :=
   | |- _ => progress fwd
   end.
 
-Definition don't_know_how_to_prove{A: Type}(R: A -> A -> Prop) := R.
-Notation "'don't_know_how_to_prove' R x y" :=
-  (don't_know_how_to_prove R x y)
-  (only printing, at level 10, x at level 0, y at level 0,
-   format "don't_know_how_to_prove  R '//' x '//' y").
-
 Lemma eq_to_impl1[mem: Type]: forall (P Q: mem -> Prop), P = Q -> impl1 P Q.
 Proof. intros. subst. reflexivity. Qed.
 
@@ -654,6 +685,7 @@ Ltac default_careful_reflexivity_step :=
   | |- _ ?l ?r => subst l
   | |- _ ?l ?r => subst r
   | |- _ => turn_relation_into_eq; syntactic_f_equal_with_ZnWords
+  | |- @eq (list _) _ _ => list_eq_step
   | |- ?rel (?pred1 ?val1 ?addr1) (?pred2 ?val2 ?addr2) =>
       is_evar val2;
       (* When is it safe to instantiate the evar val2 with val1?
@@ -686,14 +718,6 @@ Ltac default_careful_reflexivity_step :=
           end
       end;
       unify val2 val1
-  | |- ?rel ?l ?r =>
-      lazymatch rel with
-      | @eq _ => idtac
-      | @impl1 _ => idtac
-      | @iff1 _ => idtac
-      (* fails if rel is already a (don't_know_how_to_prove _) *)
-      end;
-      change (don't_know_how_to_prove rel l r)
   end.
 
 (* supposed to work on goals of the form (?rel ?lhs ?rhs), with rel being on of
@@ -733,6 +757,11 @@ Ltac clear_mem_split_eqs :=
 Ltac clear_heaplets :=
   repeat match goal with
     | m: @map.rep (@word.rep _ _) Coq.Init.Byte.byte _ |- _ => clear m
+    end.
+
+Ltac clear_traces :=
+  repeat match goal with
+    | t: trace |- _ => clear t
     end.
 
 Ltac is_ground_string s :=
@@ -843,6 +872,20 @@ Ltac conclusion_shape_based_step logger :=
   | |- forall t' m' (retvs: list ?word), _ -> update_locals _ retvs ?l _ =>
       logger ltac:(fun _ => idtac "intro new state after function call");
       intros
+  | |- state_implication _ _ =>
+      logger ltac:(fun _ => idtac "state_implication: clear old state and intro new state");
+      clear_heapletwise_hyps;
+      clear_mem_split_eqs;
+      clear_heaplets;
+      clear_traces;
+      intros ? ? ?;
+      lazymatch goal with
+      | |- expect_1expr_return _ _ _ _ -> expect_1expr_return _ _ _ _ =>
+          let hGet := fresh in
+          intros [? hGet ?];
+          eapply mk_expect_1expr_return; [exact hGet | clear hGet]
+      | |- _ => intro
+      end
   | |- @eq (@map.rep string (@word.rep _ _) _) ?LHS ?RHS =>
       is_map_expr_with_ground_keys LHS;
       is_map_expr_with_ground_keys RHS;
@@ -891,9 +934,12 @@ Ltac sidecond_step logger := first
             [ logger ltac:(fun _ => idtac "discarding contradictory branch of \/ in" H) ]
         end
       | lazymatch goal with
-        | |- ?P /\ ?Q =>
+        | |- ?g =>
+            is_destructible_and g;
             split;
             logger ltac:(fun _ => idtac "split")
+        end
+      | lazymatch goal with
         | |- _ = _ =>
             careful_reflexivity_step_hook;
             logger ltac:(fun _ => idtac "careful_reflexivity_step_hook")
@@ -921,8 +967,13 @@ Ltac sidecond_step logger := first
             intros (* don't put this too early, because heapletwise has some
                       specialized intros that rename and move new hyps *)
         end
-      | solve [intuition idtac];
-        logger ltac:(fun _ => idtac "intuition idtac") ].
+      | lazymatch goal with
+        | |- _ = _ => fail
+        | |- _ => (* Beware: intuition runs unification that arbitrarily unfolds
+                     definitions, might need to stop using it *)
+                  solve [intuition idtac];
+                  logger ltac:(fun _ => idtac "intuition idtac")
+        end ].
 
 Ltac final_program_logic_step logger :=
   (* Note: Here, the logger has to be invoked *after* the tactic, because we only
@@ -953,10 +1004,10 @@ Ltac final_program_logic_step logger :=
         end ].
 
 Ltac new_heapletwise_hyp_hook h t ::=
-  puri_simpli_zify_hyp accept_unless_follows_by_xlia h t.
+  puri_simpli_zify_hyp false h t.
 
 Ltac heapletwise_hyp_pre_clear_hook H ::=
-  let T := type of H in puri_simpli_zify_hyp accept_unless_follows_by_xlia H T.
+  let T := type of H in puri_simpli_zify_hyp false H T.
 
 Ltac fwd_subst H ::= idtac.
 
@@ -988,7 +1039,7 @@ Ltac undisplay logger :=
   | _: currently ?s |- _ =>
       constr_eq s displaying;
       zify_hyps;
-      puri_simpli_zify_hyps accept_unless_follows_by_xlia;
+      puri_simpli_zify_hyps false;
       set_state stepping;
       logger ltac:(fun _ => idtac "purify & zify")
   end.
@@ -1018,7 +1069,6 @@ Ltac can_continue :=
 Ltac one_step :=
   lazymatch goal with
   | |- @ready _ => fail
-  | |- don't_know_how_to_prove _ _ _ => fail
   | |- after_if _ _ _ _ _ _ => fail
   | |- needs_opening_else_and_lbrace _ => fail
   | |- expect_1expr_return _ _ _ _ => fail

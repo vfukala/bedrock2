@@ -872,9 +872,44 @@ Section WithParams.
       eapply word.unsigned_inj. rewrite word.unsigned_of_Z_0. exact E.
   Qed.
 
+  Lemma wp_dowhile {measure : Type} (v0 : measure) (e: expr) (c: cmd) t (m: mem) l fs rest
+    (invariant: measure -> trace -> mem -> locals -> Prop) {lt}
+    {post : trace -> mem -> locals -> Prop}
+    (Hpre: invariant v0 t m l)
+    (Hwf : well_founded lt)
+    (Hbody : forall v t m l,
+      invariant v t m l ->
+      loop_body_marker (wp_cmd fs c t m l (fun t' m' l' =>
+        exists b, dexpr_bool3 m' l' e b
+                    (exists v', invariant v' t' m' l' /\ lt v' v)
+                    (pop_scope_marker (after_loop fs rest t' m' l' post))
+                    True)))
+    : wp_cmd fs (cmd.seq (cmd.dowhile c e) rest) t m l post.
+  Proof.
+    eapply wp_seq. eapply wp_dowhile0. 1,2: eassumption.
+    intros * Hinv. specialize Hbody with (1 := Hinv).
+    eapply exec.weaken. 1: exact Hbody.
+    clear Hinv Hbody t t0 m0 l0 Hpre.
+    cbv beta. intros ? ? ? [b H]. inversion H. subst. clear H.
+    eexists. split. 1: eassumption.
+    unfold bool_expr_branches in *. apply proj1 in H2. split.
+    - intro NE.
+      rewrite word.eqb_ne in H2. 1: eapply H2. intro C. subst v1.
+      apply NE. apply word.unsigned_of_Z_0.
+    - intro E. rewrite word.eqb_eq in H2. 1: eapply H2.
+      eapply word.unsigned_inj. rewrite word.unsigned_of_Z_0. exact E.
+  Qed.
+
   (* alias of "exists" to mark ghost vars of tailrecursive loop body calls that need
      to be provided (at least partially) manually *)
   Definition provide_new_ghosts{Ghosts: Type}: (Ghosts -> Prop) -> Prop := @ex Ghosts.
+
+  (* marker for tactics to detect that before proving this implication, we can
+     clear all other state
+     (TODO: could also be used for Hbody, Hrest hyps of while lemmas, and for remainder
+     in call lemmas) *)
+  Definition state_implication(P1 P2: trace -> mem -> locals -> Prop): Prop :=
+    forall t m l, P1 t m l -> P2 t m l.
 
   Lemma wp_while_tailrec {measure: Type} {Ghost: Type} (v0: measure) (g0: Ghost)
     (e: expr) (c: cmd) t0 (m0: mem) l0 fs rest
@@ -894,10 +929,11 @@ Section WithParams.
                   (post (g, v, t, m, l))
                   (loop_body_marker (bool_expr_branches b (wp_cmd fs c t m l
                       (fun t' m' l' => exists v', provide_new_ghosts (fun g' =>
-                           pre (g', v', t', m', l') /\
-                           lt v' v /\
-                           (forall t'' m'' l'', post (g', v', t'', m'', l'') ->
-                                                post (g , v , t'', m'', l''))))) True True)))
+                         pre (g', v', t', m', l') /\
+                         lt v' v /\
+                         state_implication (fun t'' m'' l'' => post (g', v', t'', m'', l''))
+                                           (fun t'' m'' l'' => post (g , v , t'', m'', l''))
+                      ))) True True)))
     (Hrest: forall t m l, post (g0, v0, t, m, l) -> wp_cmd fs rest t m l finalpost)
     : wp_cmd fs (cmd.seq (cmd.while e c) rest) t0 m0 l0 finalpost.
   Proof.
@@ -939,9 +975,9 @@ Section WithParams.
                       (fun t' m' l' => exists v', provide_new_ghosts (fun g' =>
                            pre (g', v', t', m', l') /\
                            lt v' v /\
-                           (forall t'' m'' l'', functionpost g' v' t'' m'' l'' ->
-                                                functionpost g  v  t'' m'' l'')))))
-                  (wp_cmd fs rest t m l (functionpost g v))
+                           state_implication (functionpost g' v')
+                                             (functionpost g  v )))))
+                  (pop_scope_marker (after_loop fs rest t m l (functionpost g v)))
                   True)
     : wp_cmd fs (cmd.seq (cmd.while e c) rest) t0 m0 l0 (functionpost g0 v0).
   Proof.
@@ -983,9 +1019,9 @@ Section WithParams.
                     (exists v', provide_new_ghosts (fun g' =>
                         pre (g', v', t', m', l') /\
                         lt v' v /\
-                        (forall t'' m'' l'', functionpost g' v' t'' m'' l'' ->
-                                             functionpost g  v  t'' m'' l'')))
-                    (wp_cmd fs rest t' m' l' (functionpost g v))
+                        state_implication (functionpost g' v')
+                                          (functionpost g  v )))
+                    (pop_scope_marker (after_loop fs rest t' m' l' (functionpost g v)))
                     True)))
     : wp_cmd fs (cmd.seq (cmd.dowhile c e) rest) t0 m0 l0 (functionpost g0 v0).
   Proof.
@@ -1042,10 +1078,9 @@ Section WithParams.
     + eapply false_Acc.
   Qed.
 
-  (* Useful for while loops with a done flag:
-     Once done is set to true, we don't need to prove pre again for the
-     next non-iteration, but we can prove post instead. *)
-  Lemma wp_while_tailrec_with_done_flag {measure: Type} {Ghost: Type}
+  (* Often, after the last iteration, pre doesn't hold any more.
+     For such cases, this lemma allows proving post instead. *)
+  Lemma wp_while_tailrec_skip_last_pre {measure: Type} {Ghost: Type}
     (v0: measure) (g0: Ghost)
     (e: expr) (c: cmd) t0 (m0: mem) l0 fs rest
     (pre post: Ghost * measure * trace * mem * locals -> Prop) {lt}
@@ -1069,8 +1104,9 @@ Section WithParams.
                            (exists v', provide_new_ghosts (fun g' =>
                                pre (g', v', t', m', l') /\
                                lt v' v /\
-                               (forall t'' m'' l'', post (g', v', t'', m'', l'') ->
-                                                    post (g , v , t'', m'', l''))))
+                               state_implication
+                                 (fun t'' m'' l'' => post (g', v', t'', m'', l''))
+                                 (fun t'' m'' l'' => post (g , v , t'', m'', l''))))
                            (post (g, v, t', m', l'))
                            True)) True True)))
     (Hrest: forall t m l, post (g0, v0, t, m, l) -> wp_cmd fs rest t m l finalpost)
@@ -1113,7 +1149,7 @@ Section WithParams.
           { eexists. split. 1: eassumption. rewrite word.eqb_eq; reflexivity. }
           { eassumption. }
           { exact I. }
-          intros *. exact id. }
+          intros ? ? ?. exact id. }
         { fwd.
           eexists (true, v'(* new, smaller measure *)), _.
           ssplit.
@@ -1123,6 +1159,59 @@ Section WithParams.
           { simpl. assumption. }
           assumption. } } }
       { assumption. }
+  Qed.
+
+  (* Note: cannot have any code after the loop because it would have to be
+     stepped through twice! *)
+  Lemma wp_while_tailrec_skip_last_pre_use_functionpost{measure: Type}{Ghost: Type}
+    (v0: measure)(g0: Ghost)
+    (e: expr) (c: cmd) t0 (m0: mem) l0 fs
+    (pre: Ghost * measure * trace * mem * locals -> Prop) {lt}
+    {functionpost: Ghost -> measure -> trace -> mem -> locals -> Prop}
+    (Hwf: well_founded lt)
+    (* packaging generalized context at entry of loop determines pre: *)
+    (Hpre: pre (g0, v0, t0, m0, l0))
+    (Hbody: forall v g t m l,
+      pre (g, v, t, m, l) ->
+      exists b, dexpr_bool3 m l e b
+                  (loop_body_marker (wp_cmd fs c t m l
+                      (fun t' m' l' => exists v',
+                           (* executing condition e again! *)
+                           exists b', dexpr_bool3 m' l' e b'
+                              (provide_new_ghosts (fun g' =>
+                                 pre (g', v', t', m', l') /\
+                                 lt v' v /\
+                                   state_implication (functionpost g' v')
+                                     (functionpost g  v )))
+                              (functionpost g v t' m' l')
+                              True)))
+                  (functionpost g v t m l)
+                  True)
+    : wp_cmd fs (cmd.while e c) t0 m0 l0 (functionpost g0 v0).
+  Proof.
+    enough (exec fs (cmd.seq (cmd.while e c) cmd.skip) t0 m0 l0 (functionpost g0 v0)). {
+      inversion H. subst. eapply exec.weaken. 1: eassumption.
+      intros. specialize (H7 _ _ _ H0). inversion H7. subst. assumption.
+    }
+    eapply wp_while_tailrec_skip_last_pre with
+      (post := fun '(g, v, t, m, l) => functionpost g v t m l).
+    1: exact Hwf.
+    1: exact Hpre.
+    2: { clear. intros. eapply exec.skip. assumption. }
+    intros * HPre.
+    specialize Hbody with (1 := HPre).
+    destruct Hbody as (b & Hbody).
+    inversion Hbody. subst. clear Hbody.
+    unfold bool_expr_branches, loop_body_marker in *. apply proj1 in H1.
+    eexists. destruct_one_match_hyp;
+      (econstructor; [eassumption | reflexivity | unfold bool_expr_branches]);
+      ssplit; rewrite ?word.eqb_ne, ?word.eqb_eq by congruence; simpl; try exact I.
+    2: assumption.
+    eapply exec.weaken. 1: eassumption.
+    cbv beta. clear H1. intros. fwd. inversion H0. subst. clear H0.
+    eexists. econstructor. 1: eassumption. 1: reflexivity.
+    unfold bool_expr_branches, provide_new_ghosts, state_implication in *.
+    destruct_one_match_hyp; fwd; eauto 10.
   Qed.
 
   Inductive dexprs1(m: mem)(l: locals)(es: list expr)(vs: list word)(P: Prop): Prop :=

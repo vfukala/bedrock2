@@ -1,5 +1,5 @@
 Require Import coqutil.Ltac2Lib.Ltac2.
-Require Import coqutil.Ltac2Lib.Failf coqutil.Ltac2Lib.rdelta.
+Require Import coqutil.Ltac2Lib.Failf coqutil.Ltac2Lib.rdelta coqutil.Ltac2Lib.Lia.
 Require Import Coq.ZArith.ZArith. Local Open Scope Z_scope.
 Require Import Coq.micromega.Lia.
 Require Import coqutil.Word.Interface coqutil.Word.Properties.
@@ -411,13 +411,6 @@ Ltac2 local_ring_simplify(parent: expr_kind)(e: constr): res :=
     if Int.lt (ring_expr_size (new_term r)) (ring_expr_size e) then r
     else gfail "ring_simplify does not shrink the expression size".
 
-(* TODO move *)
-Ltac2 lia0 () := ltac1:(lia).
-Ltac2 Notation lia := lia0 ().
-
-Ltac2 eassumption0 () := ltac1:(eassumption).
-Ltac2 Notation eassumption := eassumption0 ().
-
 Module List.
   Import List.ZIndexNotations. Local Open Scope zlist_scope.
 
@@ -437,18 +430,78 @@ Module List.
     end.
   Abort.
 
+  (* Given (e1 :: .. :: eN :: non_concrete_tail), returns a pair containing
+     (e1 :: .. :: eN :: acc) and non_concrete_tail.
+     Note: Callees should not forget to consider the case where e is fully concrete. *)
+  Ltac2 rec peel_off_concrete_part(e: constr)(acc: constr): constr * constr :=
+    lazy_match! e with
+    | cons ?x ?xs => let (c, nc) := peel_off_concrete_part xs acc in ('(cons $x $c), nc)
+    | _ => (acc, e)
+    end.
+
+  Goal forall (b1 b2 b3: bool) (l: list bool), True.
+    intros.
+    let (c, nc) := peel_off_concrete_part '(b1 :: b2 :: b3 :: l) '(@nil bool) in
+    lazy_match! c with
+    | [|b1; b2; b3|] =>
+        lazy_match! nc with
+        | l => ()
+        end
+    end.
+  Abort.
+
+  (* Given `e` of type `list A`, returns `xss` of type `list (list A)` such that
+     `List.apps xss` is convertible to `e`, and each argument to ++ becomes an
+     element of the resulting list, and cons is only used for lists whose structure
+     is fully concrete (i.e. (e1 :: e2 :: non_concrete_tail) is turned into two
+     list elements, [|e1; e2|] and non_concrete_tail). *)
+  Ltac2 rec reify_apps_and_cons(e: constr): constr :=
+    lazy_match! e with
+    | @cons ?tp ?x ?xs => let (c, nc) := peel_off_concrete_part e '(@nil $tp) in
+                          let r := reify_apps_and_cons nc in '(cons $c $r)
+    | List.app ?xs ?ys =>
+        (* Note: no recursion into xs because that might not be convertible
+           and we expect e to be already right-leaning in typical use cases *)
+        let r := reify_apps_and_cons ys in '(cons $xs $r)
+    | @nil ?tp => '(@nil (list $tp))
+    | _ => '([|$e|])
+    end.
+
+  Goal forall (l1 l2 l3: list Z) (a b c: Z), True.
+    intros.
+    let r := reify_apps_and_cons
+               '([|a; b|] ++ [|c|] ++ l1 ++ a :: b :: l2 ++ [|a; b|] ++ c :: l3) in
+    lazy_match! r with
+    | [| [|a; b|]; [|c|]; l1; [|a; b|]; l2; [|a; b|]; [|c|]; l3 |] => ()
+    end.
+    let r := reify_apps_and_cons '(l2 ++ [|a; b|]) in
+    lazy_match! r with
+    | [| l2; [|a; b|] |] => ()
+    end.
+  Abort.
+
+  Section ZList_TODO_MOVE.
+    Context [A: Type].
+
+    Lemma upto_nil: forall i, (@nil A)[:i] = nil.
+    Proof. intros. unfold List.upto. apply List.firstn_nil. Qed.
+
+    Lemma from_nil: forall i, (@nil A)[i:] = nil.
+    Proof. intros. unfold List.from. apply List.skipn_nil. Qed.
+  End ZList_TODO_MOVE.
+
   Section WithA.
     Context [A: Type].
 
     (* Same as List.concat, but does not result in a trailing `++ nil` when unfolded *)
-    Fixpoint apps(xss: list (list A)): list A :=
+    Fixpoint cbn_concat(xss: list (list A)): list A :=
       match xss with
       | nil => nil
       | ys :: nil => ys
-      | h :: t => h ++ apps t
+      | h :: t => h ++ cbn_concat t
       end.
 
-    Lemma apps_concat: forall (xss: list (list A)), apps xss = List.concat xss.
+    Lemma cbn_concat_spec: forall (xss: list (list A)), cbn_concat xss = List.concat xss.
     Proof.
       induction xss. 1: reflexivity.
       simpl. rewrite <- IHxss.
@@ -459,25 +512,59 @@ Module List.
     Definition cbn_app: list (list A) -> list (list A) -> list (list A) :=
       Eval unfold List.app in @List.app (list A).
 
+    Lemma cbn_app_spec: cbn_app = @List.app (list A).
+    Proof. reflexivity. Qed.
+
     Lemma reassoc_app: forall (xss yss: list (list A)) (xs ys zs: list A),
-        apps xss = xs ->
-        apps yss = ys ->
-        apps (cbn_app xss yss) = zs ->
+        cbn_concat xss = xs ->
+        cbn_concat yss = ys ->
+        cbn_concat (cbn_app xss yss) = zs ->
         List.app xs ys = zs.
     Proof.
-      intros. subst. rewrite 3apps_concat. change cbn_app with (@List.app (list A)).
+      intros. subst. rewrite 3cbn_concat_spec. change cbn_app with (@List.app (list A)).
       symmetry. apply List.concat_app.
+    Qed.
+
+    Lemma reassoc_app_mergeable_in_middle:
+      forall (xss yss: list (list A)) (last_xs first_ys simpler xs ys zs: list A),
+        cbn_concat (cbn_app xss (cons last_xs nil)) = xs ->
+        cbn_concat (cons first_ys yss) = ys ->
+        List.app last_xs first_ys = simpler ->
+        cbn_concat (cbn_app xss (cons simpler yss)) = zs ->
+        List.app xs ys = zs.
+    Proof.
+      intros. subst. rewrite ?cbn_concat_spec, ?cbn_app_spec.
+      repeat (rewrite ?List.concat_app; simpl; rewrite <- List.app_assoc).
+      reflexivity.
     Qed.
 
     Definition cbn_firstn: nat -> list (list A) -> list (list A) :=
       Eval unfold List.firstn in @List.firstn (list A).
 
+    Lemma cbn_firstn_spec: cbn_firstn = @List.firstn (list A).
+    Proof. reflexivity. Qed.
+
     Definition cbn_dropRight(n: nat)(ls: list (list A)): list (list A) :=
       Eval unfold List.length, Nat.sub, List.firstn in
         List.firstn (Nat.sub (List.length ls) n) ls.
 
+    Lemma cbn_dropRight_spec(n: nat)(ls: list (list A)):
+        cbn_dropRight n ls = List.firstn (Nat.sub (List.length ls) n) ls.
+    Proof. reflexivity. Qed.
+
+    Definition cbn_takeRight(n: nat)(ls: list (list A)): list (list A) :=
+      Eval unfold List.length, Nat.sub, List.skipn in
+        List.skipn (Nat.sub (List.length ls) n) ls.
+
+    Lemma cbn_takeRight_spec(n: nat)(ls: list (list A)):
+        cbn_takeRight n ls = List.skipn (Nat.sub (List.length ls) n) ls.
+    Proof. reflexivity. Qed.
+
     Definition cbn_skipn: nat -> list (list A) -> list (list A) :=
       Eval unfold List.skipn in @List.skipn (list A).
+
+    Lemma cbn_skipn_spec: cbn_skipn = @List.skipn (list A).
+    Proof. reflexivity. Qed.
 
     Fixpoint cbn_len_sum(xss: list (list A)): Z :=
       match xss with
@@ -485,17 +572,25 @@ Module List.
       | h :: t => len h + cbn_len_sum t
       end.
 
-    (* alternative to try out: zipper style: reversed left list of lists *)
+    Lemma cbn_len_sum_nonneg: forall xss, 0 <= cbn_len_sum xss.
+    Proof. induction xss; simpl; lia. Qed.
+
+    Lemma cbn_len_sum_app: forall xss yss,
+        cbn_len_sum (xss ++ yss) = cbn_len_sum xss + cbn_len_sum yss.
+    Proof. intros. induction xss; intros; cbn; lia. Qed.
+
+    Lemma cbn_len_sum_spec: forall xss, cbn_len_sum xss = len (List.concat xss).
+    Proof. induction xss; simpl; rewrite ?List.app_length; lia. Qed.
 
     Lemma upto_apps0: forall n i (xs: list A) (xss: list (list A))
                             (ys: list A) (yss: list (list A)),
         i <= cbn_len_sum (cbn_firstn n xss) ->
         cbn_firstn n xss = yss ->
-        apps xss = xs ->
-        apps yss = ys ->
+        cbn_concat xss = xs ->
+        cbn_concat yss = ys ->
         List.upto i xs = List.upto i ys.
     Proof.
-      intros. subst. rewrite 2apps_concat. revert i xss H.
+      intros. subst. rewrite 2cbn_concat_spec. revert i xss H.
       induction n; intros; simpl in *.
       - rewrite 2List.upto_beginning; trivial.
       - destruct xss. 1: reflexivity.
@@ -503,14 +598,340 @@ Module List.
         rewrite 2List.upto_app. f_equal. apply IHn. lia.
     Qed.
 
-    Lemma upto_apps: forall n i (xs: list A) (xss: list (list A))
+    Lemma upto_apps_drop_r: forall n i (xs: list A) (xss: list (list A))
                             (ys: list A) (yss: list (list A)),
         i <= cbn_len_sum (cbn_dropRight n xss) ->
         cbn_dropRight n xss = yss ->
-        apps xss = xs ->
-        apps yss = ys ->
+        cbn_concat xss = xs ->
+        cbn_concat yss = ys ->
         List.upto i xs = List.upto i ys.
     Proof. unfold cbn_dropRight. intros. eapply upto_apps0; eassumption. Qed.
+
+    (* Example: If we know that i points somewhere into xs2 or xs3, we can
+                pull some listlets (xs0 and xs1) out of the upto on the left:
+       (xs0 ++ xs1 ++ xs2 ++ xs3 ++ xs4)[:i] =
+       xs0 ++ xs1 ++ (xs2 ++ xs3)[:i - len xs0 - len xs1] *)
+    Lemma upto_apps_pullout_l: forall n i j (xs xs2: list A) (xss xss1 xss2: list (list A))
+                                      (ys: list A) (yss: list (list A)),
+        cbn_len_sum (cbn_firstn n xss) <= i ->
+        cbn_firstn n xss = xss1 ->
+        cbn_skipn n xss = xss2 ->
+        i - cbn_len_sum (cbn_firstn n xss) = j ->
+        cbn_concat xss = xs ->
+        cbn_concat xss2 = xs2 ->
+        cbn_app xss1 (cons (List.upto j xs2) nil) = yss ->
+        cbn_concat yss = ys ->
+        List.upto i xs = ys.
+    Proof.
+      induction n; intros; subst.
+      - simpl. f_equal. lia.
+      - destruct xss.
+        + simpl. f_equal. lia.
+        + rewrite ?cbn_concat_spec. simpl in *.
+          pose proof (cbn_len_sum_nonneg (cbn_firstn n xss)).
+          rewrite List.upto_app_pushdown_r by lia.
+          f_equal. rewrite <-?cbn_concat_spec.
+          eapply IHn; try reflexivity. 1: lia.
+          f_equal. f_equal. f_equal. f_equal. lia.
+    Qed.
+
+    (* Example: If we know that i points somewhere into xs2 or xs3, we can
+                discard some listlets on the right (x4),
+                and pull some (xs0 and xs1) out of the upto on the left:
+       (xs0 ++ xs1 ++ xs2 ++ xs3 ++ xs4)[:i] =
+       xs0 ++ xs1 ++ (xs2 ++ xs3)[:i - len xs0 - len xs1] *)
+    Lemma upto_apps: forall nL nR i j (xs xs2 xs2': list A) (xss xss1 xss2: list (list A))
+                            (ys: list A) (yss: list (list A)),
+        cbn_len_sum (cbn_firstn nL xss) <= i ->
+        i <= cbn_len_sum (cbn_dropRight nR xss) ->
+        cbn_firstn nL xss = xss1 ->
+        i - cbn_len_sum xss1 = j ->
+        cbn_dropRight nR (cbn_skipn nL xss) = xss2 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss2 = xs2 ->
+        List.upto j xs2 = xs2' ->
+        cbn_app xss1 (cons xs2' nil) = yss ->
+        cbn_concat yss = ys ->
+        List.upto i xs = ys.
+    Proof.
+      intros * H H0 H1 H2 H3 H4 H5 xs2'Def H6 H7. subst xs2'.
+      (* discard special case: *)
+      assert (length xss < nL + nR \/ nL + nR <= length xss)%nat as CL by lia.
+      destruct CL as [CL | CL]. {
+        rewrite ?cbn_firstn_spec in *.
+        rewrite ?cbn_dropRight_spec in *.
+        rewrite ?cbn_skipn_spec in *.
+        pose proof H3 as P.
+        apply (f_equal (@length _)) in P.
+        rewrite List.firstn_length, List.skipn_length in P.
+        assert (length xss2 = 0)%nat as L0 by lia.
+        destruct xss2 > [clear L0 | simpl in L0; exfalso; lia].
+        simpl in H5. subst xs2.
+        rewrite cbn_app_spec in H6. rewrite List.upto_nil in H6.
+        subst yss.
+        rewrite cbn_concat_spec in H7. rewrite List.concat_app in H7. simpl in H7.
+        rewrite List.app_nil_r in H7.
+        clear P.
+        subst j xs ys.
+        assert (length xss - nR <= nL)%nat by lia.
+        assert (i = cbn_len_sum (List.firstn nL xss)). {
+          pose proof (List.firstn_firstn xss (length xss - nR) nL) as B.
+          assert (Init.Nat.min (length xss - nR) nL = length xss - nR)%nat as E by lia.
+          rewrite E in B; clear E.
+          rewrite <- B in H0.
+          rewrite H1 in *.
+          rewrite <- (List.firstn_skipn (length xss - nR) xss1) in H|-*.
+          rewrite cbn_len_sum_app in H|-*.
+          remember (cbn_len_sum (List.firstn (length xss - nR) xss1)) as len1.
+          pose proof (cbn_len_sum_nonneg (List.skipn (length xss - nR) xss1)).
+          lia.
+        }
+        subst i xss1.
+        rewrite cbn_concat_spec.
+        clear.
+        revert nL. induction xss; intros; simpl.
+        - rewrite List.upto_nil. rewrite List.firstn_nil. reflexivity.
+        - destruct nL; simpl.
+          + reflexivity.
+          + pose proof (cbn_len_sum_nonneg (List.firstn nL xss)).
+            rewrite List.upto_app_pushdown_r by lia. f_equal.
+            rewrite <-IHxss. f_equal. lia.
+      }
+      (* main proof: *)
+      subst.
+      eapply upto_apps_pullout_l with (n := nL); try reflexivity. 1: assumption.
+      f_equal. f_equal. f_equal.
+      remember (cbn_skipn nL xss) as ll.
+      eapply upto_apps_drop_r; try reflexivity.
+      enough (cbn_len_sum (cbn_dropRight nR xss) =
+                cbn_len_sum (cbn_firstn nL xss) + cbn_len_sum (cbn_dropRight nR ll)) by lia.
+      subst ll.
+      rewrite ?cbn_dropRight_spec, cbn_firstn_spec, cbn_skipn_spec.
+      rewrite List.firstn_skipn_comm.
+      rewrite List.length_skipn.
+      replace (nL + (length xss - nL - nR))%nat with (length xss - nR)%nat by lia.
+      rewrite <- cbn_len_sum_app.
+      f_equal.
+      pose proof (List.firstn_skipn nL (List.firstn (length xss - nR) xss)) as B.
+      rewrite List.firstn_firstn in B.
+      rewrite Nat.min_l in B by lia.
+      symmetry. exact B.
+    Qed.
+
+    (* Special case of upto_apps, allowing reuse of proofs already computed for upto_apps.
+       Example: If we know that i points to exactly between xs2 and xs3, we can
+                discard some listlets on the right (xs4),
+                and also drop the upto
+       (xs0 ++ xs1 ++ xs2 ++ xs3 ++ xs4)[:i] = xs0 ++ xs1 ++ xs2 *)
+    Lemma upto_apps_at_boundary: forall nL nR i (xs xs1: list A) (xss xss1: list (list A)),
+        (nL + nR = length xss)%nat ->
+        cbn_len_sum (cbn_firstn nL xss) <= i ->
+        i <= cbn_len_sum (cbn_dropRight nR xss) ->
+        cbn_firstn nL xss = xss1 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss1 = xs1 ->
+        List.upto i xs = xs1.
+    Proof.
+      intros. subst.
+      eapply upto_apps; try eassumption; try reflexivity.
+      rewrite cbn_app_spec, 3cbn_concat_spec.
+      rewrite List.concat_app. simpl. rewrite List.app_nil_r.
+      rewrite <- (List.app_nil_r (List.concat (cbn_firstn nL xss))) at 2.
+      f_equal.
+      replace (cbn_dropRight nR (cbn_skipn nL xss)) with (@nil (list A)).
+      - simpl. apply List.upto_nil.
+      - rewrite cbn_skipn_spec, cbn_dropRight_spec.
+        symmetry. rewrite List.length_skipn.
+        eapply List.firstn_eq_O. lia.
+    Qed.
+
+    Lemma from_apps_drop_l: forall n i j (xs xs2 xs2': list A) (xss xss2: list (list A)),
+        cbn_len_sum (cbn_firstn n xss) <= i ->
+        i - cbn_len_sum (cbn_firstn n xss) = j ->
+        cbn_skipn n xss = xss2 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss2 = xs2 ->
+        List.from j xs2 = xs2' ->
+        List.from i xs = xs2'.
+    Proof.
+      intros. subst. rewrite 2cbn_concat_spec. revert i xss H.
+      induction n; intros; simpl in *.
+      - f_equal. lia.
+      - destruct xss.
+        + f_equal. simpl. lia.
+        + simpl in *.
+          rewrite List.from_app. rewrite IHn by lia.
+          pose proof (cbn_len_sum_nonneg (cbn_firstn n xss)).
+          rewrite List.from_pastend by lia.
+          rewrite List.app_nil_l.
+          f_equal.
+          lia.
+    Qed.
+
+    (* Example: If we know that i points somewhere into xs1 or xs2, we can
+                pull some listlets (xs3 and xs4) out of the from on the right:
+       (xs1 ++ xs2 ++ xs3 ++ xs4)[i:] = (xs1 ++ xs2)[:i] ++ xs3 ++ xs4 *)
+    Lemma from_apps_pullout_r': forall n i (xs xs1 xs1' xs2: list A)
+                                      (xss xss1 xss2: list (list A)),
+        i <= cbn_len_sum (cbn_firstn n xss) ->
+        cbn_firstn n xss = xss1 ->
+        cbn_skipn n xss = xss2 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss1 = xs1 ->
+        cbn_concat xss2 = xs2 ->
+        List.from i xs1 = xs1' ->
+        List.from i xs = List.app xs1' xs2.
+    Proof.
+      intros; subst.
+      rewrite ?cbn_concat_spec.
+      rewrite <- (List.firstn_skipn n xss) at 1. rewrite List.concat_app.
+      rewrite cbn_firstn_spec, cbn_skipn_spec.
+      apply List.from_app_pushdown_l.
+      rewrite cbn_len_sum_spec in H.
+      exact H.
+    Qed.
+
+    Lemma from_apps_pullout_r: forall nR i (xs xs1 xs1' xs2: list A)
+                                      (xss xss1 xss2: list (list A)),
+        i <= cbn_len_sum (cbn_dropRight nR xss) ->
+        cbn_dropRight nR xss = xss1 ->
+        cbn_takeRight nR xss = xss2 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss1 = xs1 ->
+        cbn_concat xss2 = xs2 ->
+        List.from i xs1 = xs1' ->
+        List.from i xs = List.app xs1' xs2.
+    Proof.
+      intros. subst. eapply from_apps_pullout_r';
+        rewrite ?cbn_len_sum_spec, ?cbn_firstn_spec, ?cbn_skipn_spec,
+                ?cbn_takeRight_spec, ?cbn_dropRight_spec in *;
+        try eassumption;
+        try reflexivity.
+    Qed.
+
+    (* Example: If we know that i points somewhere into xs1 or xs2, we can
+                discard some listlets on the left (xs0)
+                and pull some (xs3 and xs4) out of the from on the right:
+       (xs0 ++ xs1 ++ xs2 ++ xs3 ++ xs4)[i:] =
+       (xs1 ++ xs2)[i - len xs0 :] ++ xs3 ++ xs4 *)
+    Lemma from_apps: forall nL nR i j (xs xs2 xs2' xs3: list A)
+                            (xss xss2 xss3: list (list A)),
+        cbn_len_sum (cbn_firstn nL xss) <= i ->
+        i <= cbn_len_sum (cbn_dropRight nR xss) ->
+        i - cbn_len_sum (cbn_firstn nL xss) = j ->
+        cbn_skipn nL (cbn_dropRight nR xss) = xss2 ->
+        cbn_takeRight nR xss = xss3 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss2 = xs2 ->
+        cbn_concat xss3 = xs3 ->
+        List.from j xs2 = xs2' ->
+        List.from i xs = List.app xs2' xs3.
+    Proof.
+      intros. subst xs2'.
+      (* discard special case: *)
+      assert (length xss < nL + nR \/ nL + nR <= length xss)%nat as CL by lia.
+      destruct CL as [CL | CL]. {
+        rewrite ?cbn_firstn_spec in *.
+        rewrite ?cbn_dropRight_spec in *.
+        rewrite ?cbn_skipn_spec in *.
+        pose proof H2 as P.
+        apply (f_equal (@length _)) in P.
+        rewrite List.skipn_length, List.firstn_length in P.
+        assert (length xss2 = 0)%nat as L0 by lia.
+        destruct xss2 > [clear L0 | simpl in L0; exfalso; lia].
+        simpl in H5. subst xs2.
+        rewrite cbn_takeRight_spec in H3.
+        rewrite List.from_nil. rewrite List.app_nil_l.
+        subst xs3.
+        rewrite cbn_concat_spec in *.
+        clear P.
+        subst j xs xss3.
+        assert (length xss - nR <= nL)%nat by lia.
+        assert (i = cbn_len_sum (List.firstn (length xss - nR) xss)). {
+          rewrite <- (List.firstn_skipn (length xss - nR) xss) in H.
+          rewrite List.firstn_app in H.
+          rewrite List.firstn_all2 in H by (rewrite List.firstn_length; lia).
+          rewrite cbn_len_sum_app in H.
+          rewrite ?cbn_len_sum_spec in *.
+          lia.
+        }
+        subst i.
+        rewrite cbn_len_sum_spec.
+        clear. generalize (length xss - nR)%nat as n. clear nR.
+        induction xss; intros; simpl.
+        - rewrite List.from_nil. rewrite List.skipn_nil. reflexivity.
+        - destruct n; simpl.
+          + reflexivity.
+          + rewrite <-IHxss. rewrite List.len_app. rewrite <- List.from_from by lia.
+            rewrite List.from_app_pushdown_l by lia. f_equal.
+            rewrite List.from_pastend by lia. reflexivity.
+      }
+      (* main proof: *)
+      subst.
+      eapply from_apps_pullout_r'. 6,4,2: reflexivity. 3: reflexivity.
+      2: rewrite cbn_takeRight_spec, cbn_skipn_spec; reflexivity.
+      { rewrite cbn_firstn_spec, cbn_len_sum_spec, cbn_dropRight_spec in *.
+        assumption. }
+      eapply from_apps_drop_l with (n := nL); try reflexivity.
+      { rewrite cbn_firstn_spec. rewrite List.firstn_firstn.
+        replace (Init.Nat.min nL (length xss - nR)) with nL by lia.
+        assumption. }
+      rewrite ?cbn_dropRight_spec, cbn_firstn_spec, cbn_skipn_spec.
+      rewrite List.firstn_firstn.
+      replace (Init.Nat.min nL (length xss - nR)) with nL by lia.
+      reflexivity.
+    Qed.
+
+    (* Special case of from_apps, allowing reuse of proofs already computed for from_apps.
+       Example: If we know that i points to exactly between xs1 and xs2, we can
+                discard some listlets on the left (xs0 and xs1),
+                and also drop the from
+       (xs0 ++ xs1 ++ xs2 ++ xs3 ++ xs4)[i:] = xs2 ++ xs3 ++ xs4 *)
+    Lemma from_apps_at_boundary: forall nL nR i (xs xs2: list A) (xss xss2: list (list A)),
+        (nL + nR = length xss)%nat ->
+        cbn_len_sum (cbn_firstn nL xss) <= i ->
+        i <= cbn_len_sum (cbn_dropRight nR xss) ->
+        cbn_skipn nL xss = xss2 ->
+        cbn_concat xss = xs ->
+        cbn_concat xss2 = xs2 ->
+        List.from i xs = xs2.
+    Proof.
+      intros. subst. rewrite <- (List.app_nil_l (cbn_concat (cbn_skipn nL xss))).
+      eapply from_apps; try eassumption; try reflexivity;
+        rewrite ?cbn_concat_spec, ?cbn_takeRight_spec, ?cbn_skipn_spec, ?cbn_skipn_spec,
+                ?cbn_dropRight_spec, ?cbn_len_sum_spec, ?cbn_firstn_spec;
+        replace (length xss - nR)%nat with nL by lia.
+      1: reflexivity.
+      rewrite List.skipn_all2.
+      - simpl. apply List.from_nil.
+      - rewrite List.firstn_length. lia.
+    Qed.
+
+    Lemma push_down_from_repeatz: forall (i: Z) (a: A) (n j: Z),
+        0 <= i <= n ->
+        n - i = j ->
+        List.from i (List.repeatz a n) = List.repeatz a j.
+    Proof.
+      intros. subst. unfold List.repeatz, List.from.
+      replace (Z.to_nat n) with (Z.to_nat i + Z.to_nat (n - i))%nat by lia.
+      rewrite List.repeat_app. rewrite List.skipn_app.
+      rewrite List.repeat_length. rewrite Nat.sub_diag. rewrite List.skipn_O.
+      rewrite List.skipn_all. 1: reflexivity.
+      rewrite List.repeat_length. reflexivity.
+    Qed.
+
+    Lemma push_down_upto_repeatz: forall (i: Z) (a: A) (n: Z),
+        0 <= i <= n ->
+        List.upto i (List.repeatz a n) = List.repeatz a i.
+    Proof.
+      intros. subst. unfold List.repeatz, List.upto.
+      replace (Z.to_nat n) with (Z.to_nat i + Z.to_nat (n - i))%nat by lia.
+      rewrite List.repeat_app. rewrite List.firstn_app.
+      rewrite List.repeat_length. rewrite Nat.sub_diag. rewrite List.firstn_O.
+      rewrite List.app_nil_r.
+      apply List.firstn_all2.
+      rewrite List.repeat_length. reflexivity.
+    Qed.
   End WithA.
 End List.
 
@@ -569,13 +990,13 @@ Abort.
 (* gen_stmt: ltac function taking a nat and returning a Prop
    tac: tactic to prove stmt, takes a dummy unit
    lower: min n to try
-   upper: one more than max n to try
-   Returns the proof term for the biggest possible n. *)
+   upper: max n to try
+   Returns the biggest possible n and the associated proof term *)
 Ltac2 max_n_st(gen_stmt: constr -> constr)(tac: unit -> unit)
-              (lower: constr)(upper: constr): constr :=
+              (lower: constr)(upper: constr): (constr * constr) :=
   let rec loop n :=
     let stmt := gen_stmt n in
-    try '(ltac2:(tac ()) : $stmt)
+    try (n, '(ltac2:(tac ()) : $stmt))
     else if Constr.equal n lower then
            gfail "stmt does not hold for any n within the bounds"
          else
@@ -583,10 +1004,7 @@ Ltac2 max_n_st(gen_stmt: constr -> constr)(tac: unit -> unit)
            | S ?m => loop m
            | _ => anomaly "expected a nat above %t, got %t" lower n
            end in
-  lazy_match! upper with
-  | S ?n => loop n
-  | _ => anomaly "upper should be a nonzero nat"
-  end.
+  loop upper.
 
 Goal forall (b: nat), b = 12%nat -> (3 * 3 < b)%nat.
   intros.
@@ -595,7 +1013,7 @@ Goal forall (b: nat), b = 12%nat -> (3 * 3 < b)%nat.
     | [ |- ?g ] => () (* printf "goal: %t" g *)
     end;
     cbn; lia) in
-  let pf := max_n_st (fun n => '(($n * $n < b)%nat)) tac '2%nat '7%nat in
+  let (_, pf) := max_n_st (fun n => '(($n * $n < b)%nat)) tac '2%nat '7%nat in
   pose $pf as A.
   exact A.
 Succeed Qed. Abort.
@@ -606,29 +1024,69 @@ Ltac2 rec list_length_as_nat(l: constr): constr :=
   | cons _ ?tail => let r := list_length_as_nat tail in '((S $r))
   end.
 
+Ltac2 panic_if_failure(f: unit -> 'a): 'a :=
+  match Control.case f with
+  | Val p => let (r, _) := p in r
+  | Err e => Control.throw e
+  end.
+
+(* overridden further below to just bottom_up_simpl *)
+Ltac2 mutable bottom_up_simpl_recurse(e: constr): res := Control.throw Assertion_failure.
+
 (* returns a proof whose LHS is (List.upto i l) and an RHS where the upto has been
    pushed down as far as nicely possible *)
 Ltac2 rec push_down_upto(force_progress: bool)(treat_app: bool)
                         (tp: constr)(i: constr)(l: constr): res :=
-  (*non-lazy*)match! l with
+  let nop := fun (_: unit) =>
+               if force_progress then gfail "no progress"
+               else res_nothing_to_simpl '(@List.upto $tp $i $l) in
+  match! l with
+  | _ => res_rewrite '(List.upto_beginning $l $i ltac2:(bottom_up_simpl_sidecond_hook ()))
+  | _ => res_rewrite '(List.upto_pastend $l $i ltac2:(bottom_up_simpl_sidecond_hook ()))
   | List.app _ _ =>
       if treat_app then
         let xss := List.reify_apps l in
-        let le_pf := max_n_st (* might fail *)
+        let (nL, nL_pf) := max_n_st (* might fail *)
+          (fun n => '(List.cbn_len_sum (List.cbn_firstn $n $xss) <= $i))
+          (fun _ => cbn [List.cbn_len_sum List.cbn_firstn];
+                         bottom_up_simpl_sidecond_hook ())
+          '0%nat
+          (list_length_as_nat xss) in
+        let (nR, nR_pf) := max_n_st (* might fail *)
           (fun n => '($i <= List.cbn_len_sum (List.cbn_dropRight $n $xss)))
           (fun _ => cbn [List.cbn_len_sum List.cbn_dropRight];
                          bottom_up_simpl_sidecond_hook ())
-          '1%nat
+          '0%nat
           (list_length_as_nat xss) in
-        (* n=0 (nothing to do) and n=list_length xss (result is nil) not handled here *)
-        let ys := open_constr:(_) in
-        let upto_apps_pf := '(List.upto_apps _ $i $l $xss $ys _ $le_pf
-                                      ltac2:(cbn [List.cbn_dropRight]; reflexivity)
-                                      eq_refl
-                                      ltac2:(cbn [List.apps]; reflexivity)) in
-        let res_upto_apps := res_rewrite upto_apps_pf in
-        let res_rec := push_down_upto false false tp i ys in
-        chain_res res_upto_apps res_rec
+        if Constr.equal nL '0%nat && Constr.equal nR '0%nat then nop () else
+        match Control.case (fun _ => '(eq_refl: Nat.add $nL $nR = length $xss)) with
+        | Val p => let (pf, _) := p in
+          res_rewrite '(List.upto_apps_at_boundary $nL $nR $i _ _ $xss _ $pf $nL_pf $nR_pf
+              ltac2:(cbn [List.cbn_firstn]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity))
+        | Err _ =>
+          res_rewrite '(List.upto_apps $nL $nR $i _ $l _ _ $xss _ _ _ _ $nL_pf $nR_pf
+              ltac2:(cbn [List.cbn_firstn]; reflexivity)
+              ltac2:(cbn [List.cbn_len_sum];
+                     lazy_match! goal with
+                     | [ |- ?diff = _ ] =>
+                         let res := bottom_up_simpl_recurse diff in
+                         let pf := eq_proof res in
+                         exact $pf
+                     end)
+              ltac2:(cbn [List.cbn_dropRight List.cbn_skipn]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity)
+              ltac2:(lazy_match! goal with
+                     | [ |- List.upto ?j ?xs2 = _] =>
+                         let res_rec := push_down_upto false false tp j xs2 in
+                         let pf := eq_proof res_rec in
+                         exact $pf
+                     end)
+              ltac2:(cbn [List.cbn_app]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity))
+        end
       else gfail "try next match branch"
   | List.from ?j ?l =>
       let n := i in (* sized slice of size n: l[j:][:n] *)
@@ -644,16 +1102,135 @@ Ltac2 rec push_down_upto(force_progress: bool)(treat_app: bool)
                                       ltac2:(bottom_up_simpl_sidecond_hook ())) in
       let r2 := push_down_upto false true tp i ll in
       chain_res r1 r2
+  | List.repeatz ?x ?n =>
+      res_rewrite '(List.push_down_upto_repeatz $i $x $n
+                      ltac2:(bottom_up_simpl_sidecond_hook ())) (* might fail! *)
   | _ => if is_concrete_enough i l true then
            let l' := convertible_list_upto i l in res_convertible l'
-         else
-           try res_rewrite '(List.upto_beginning $l $i
-                                  ltac2:(bottom_up_simpl_sidecond_hook ()))
-           else res_rewrite '(List.upto_pastend $l $i
-                                      ltac2:(bottom_up_simpl_sidecond_hook ()))
-  | _ => if force_progress
-         then gfail "no progress"
-         else res_nothing_to_simpl '(@List.upto $tp $i $l)
+         else nop ()
+  end.
+
+(* returns a proof whose LHS is (List.from i l) and an RHS where the from has been
+   pushed down as far as nicely possible. *)
+Ltac2 rec push_down_from(force_progress: bool)(treat_app: bool)
+                        (tp: constr)(i: constr)(l: constr): res :=
+  (*non-lazy*)match! l with
+  | _ => res_rewrite '(List.from_beginning $l $i ltac2:(bottom_up_simpl_sidecond_hook ()))
+  | _ => res_rewrite '(List.from_pastend $l $i ltac2:(bottom_up_simpl_sidecond_hook ()))
+  | List.app _ _ =>
+      if treat_app then
+        let xss := List.reify_apps l in
+        let (nL, nL_pf) := max_n_st (* might fail *)
+          (fun n => '(List.cbn_len_sum (List.cbn_firstn $n $xss) <= $i))
+          (fun _ => cbn [List.cbn_len_sum List.cbn_firstn];
+                         bottom_up_simpl_sidecond_hook ())
+          '0%nat
+          (list_length_as_nat xss) in
+        let (nR, nR_pf) := max_n_st (* might fail *)
+          (fun n => '($i <= List.cbn_len_sum (List.cbn_dropRight $n $xss)))
+          (fun _ => cbn [List.cbn_len_sum List.cbn_dropRight];
+                         bottom_up_simpl_sidecond_hook ())
+          '0%nat
+          (list_length_as_nat xss) in
+        match Control.case (fun _ => '(eq_refl: Nat.add $nL $nR = length $xss)) with
+        | Val p => let (pf, _) := p in
+          res_rewrite '(List.from_apps_at_boundary $nL $nR $i _ _ $xss _ $pf $nL_pf $nR_pf
+              ltac2:(cbn [List.cbn_skipn]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity)
+              ltac2:(cbn [List.cbn_concat]; reflexivity))
+        | Err _ =>
+            lazy_match! nL with
+            | O => lazy_match! nR with
+                   | O => gfail "fall-through to last default case at end of match"
+                   | S _ => res_rewrite '(List.from_apps_pullout_r $nR $i _ _ _ _ $xss _ _
+                                          $nR_pf
+                                          ltac2:(cbn[List.cbn_dropRight]; reflexivity)
+                                          ltac2:(cbn[List.cbn_takeRight]; reflexivity)
+                                          ltac2:(cbn[List.cbn_concat]; reflexivity)
+                                          ltac2:(cbn[List.cbn_concat]; reflexivity)
+                                          ltac2:(cbn[List.cbn_concat]; reflexivity)
+                        ltac2:(lazy_match! goal with
+                               | [ |- List.from _ ?xs1 = _] =>
+                                   let res_rec := push_down_from false false tp i xs1 in
+                                   let pf := eq_proof res_rec in
+                                   exact $pf
+                               end))
+                   end
+            | S _ => lazy_match! nR with
+                     | O => res_rewrite '(List.from_apps_drop_l $nL $i _ _ _ _ $xss _
+                              $nL_pf
+                              ltac2:(cbn [List.cbn_len_sum List.cbn_firstn];
+                                     lazy_match! goal with
+                                     | [ |- ?diff = _ ] =>
+                                         let res := bottom_up_simpl_recurse diff in
+                                         let pf := eq_proof res in
+                                         exact $pf
+                                     end)
+                               ltac2:(cbn[List.cbn_skipn]; reflexivity)
+                               ltac2:(cbn[List.cbn_concat]; reflexivity)
+                               ltac2:(cbn[List.cbn_concat]; reflexivity)
+                               ltac2:(
+                                 lazy_match! goal with
+                                 | [ |- List.from ?j ?xs2 = _] =>
+                                     let res_rec := push_down_from false false tp j xs2 in
+                                     let pf := eq_proof res_rec in
+                                     exact $pf
+                                 end))
+                     | S _ => res_rewrite '(List.from_apps $nL $nR $i _ _ _ _ _ $xss _ _
+                              $nL_pf $nR_pf
+                              ltac2:(cbn [List.cbn_len_sum List.cbn_firstn];
+                                     lazy_match! goal with
+                                     | [ |- ?diff = _ ] =>
+                                         let res := bottom_up_simpl_recurse diff in
+                                         let pf := eq_proof res in
+                                         exact $pf
+                                     end)
+                               ltac2:(cbn[List.cbn_skipn List.cbn_dropRight]; reflexivity)
+                               ltac2:(cbn[List.cbn_takeRight]; reflexivity)
+                               ltac2:(cbn[List.cbn_concat]; reflexivity)
+                               ltac2:(cbn[List.cbn_concat]; reflexivity)
+                               ltac2:(cbn[List.cbn_concat]; reflexivity)
+                               ltac2:(
+                                 lazy_match! goal with
+                                 | [ |- List.from ?j ?xs2 = _] =>
+                                     let res_rec := push_down_from false false tp j xs2 in
+                                     let pf := eq_proof res_rec in
+                                     exact $pf
+                                 end))
+                     end
+            end
+        end
+      else gfail "try next match branch"
+  | List.upto ?j ?l =>
+      (* l[:j][i:] = l[i:j] (notations expanding to the same term)  *)
+      (*      = l[i:][:j-i] (indexed_slice_to_sized_slice)          *)
+      let r_diff := ring_simplify_res_or_nothing_to_simpl '(Z.sub $j $i) in
+      let diff := new_term r_diff in
+      if Int.lt (ring_expr_size diff) (ring_expr_size j) then
+        let pf_diff := eq_proof r_diff in
+        res_rewrite '(indexed_slice_to_sized_slice $l $i $j $diff
+                              ltac2:(bottom_up_simpl_sidecond_hook ()) $pf_diff)
+      else gfail "ring_simplify does not shrink the expression size"
+  | List.from ?j ?ll =>
+      let r1 := res_rewrite '(List.from_from $ll $j $i
+                                      ltac2:(bottom_up_simpl_sidecond_hook ())
+                                      ltac2:(bottom_up_simpl_sidecond_hook ())) in
+      let r2 := push_down_from false true tp '($j + $i) ll in
+      chain_res r1 r2
+  | List.repeatz ?x ?n =>
+      res_rewrite '(List.push_down_from_repeatz $i $x $n _
+                      ltac2:(bottom_up_simpl_sidecond_hook ()) (* <- might fail! *)
+                      ltac2:(lazy_match! goal with
+                             | [ |- ?diff = _ ] =>
+                                 let res := bottom_up_simpl_recurse diff in
+                                 let pf := eq_proof res in
+                                 exact $pf
+                             end))
+  | _ => if is_concrete_enough i l true then
+           let l' := convertible_list_from i l in res_convertible l'
+         else if force_progress
+              then gfail "no progress"
+              else res_nothing_to_simpl '(@List.from $tp $i $l)
   end.
 
 Section PushDownGet.
@@ -815,12 +1392,6 @@ Ltac2 rec push_down_get(inh: constr)(l0: constr)(n: constr): res :=
   | _ => res_nothing_to_simpl '(@List.get _ $inh $l0 $n)
   end.
 
-Ltac2 panic_if_failure(f: unit -> 'a): 'a :=
-  match Control.case f with
-  | Val p => let (r, _) := p in r
-  | Err e => Control.throw e
-  end.
-
 (* We view the push_down_get procedure as computing a new index
    At the end of the toplevel call, if the index changed, we ring_simplify it once. *)
 Ltac2 rec push_down_get_top(inh: constr)(l0: constr)(n: constr): res :=
@@ -837,66 +1408,81 @@ Ltac2 rec push_down_get_top(inh: constr)(l0: constr)(n: constr): res :=
     end
   else res).
 
+Ltac2 rec is_concrete_list(e: constr): bool :=
+  lazy_match! e with
+  | nil => true
+  | cons _ ?tl => is_concrete_list tl
+  | _ => false
+  end.
+
+Ltac2 rec constr_list_length(e: constr): int :=
+  lazy_match! e with
+  | nil => 0
+  | cons _ ?tl => Int.add 1 (constr_list_length tl)
+  end.
+
+Ltac2 rec unsnoc_constr_list(e: constr): constr * constr :=
+  lazy_match! e with
+  | cons ?x (@nil ?tp) => ('(@nil $tp), x)
+  | cons ?h ?tl => let (l, last) := unsnoc_constr_list tl in
+                   ('(cons $h $l), last)
+  end.
+
+Ltac2 uncons_constr_list(e: constr): constr * constr :=
+  lazy_match! e with
+  | cons ?h ?tl => (h, tl)
+  end.
+
 Ltac2 local_zlist_simpl(e: constr): res :=
   match! e with
   | @List.upto ?tp ?i ?l => push_down_upto true true tp i l
+  | @List.from ?tp ?i ?l => push_down_from true true tp i l
   | @List.get _ ?inh ?l ?i =>
       if is_concrete_enough i l false
       then res_convertible (convertible_list_get inh l i)
       else push_down_get_top inh l i
   | @List.repeatz ?tp _ Z0 => res_convertible '(@nil $tp)
   | List.app ?xs nil => res_rewrite '(List.app_nil_r $xs)
-  | List.app ?l1 ?l2 => res_convertible (prepend_concrete_list l1 l2)
+  | List.app nil ?xs => res_convertible xs
   | List.app ?xs ?ys =>
-      (* TODO also check if rightmost list in xss can be merged with leftmost list in yss *)
-      let xss := List.reify_apps xs in
-      lazy_match! xss with
-      | cons _ nil => gfail "no need to reassoc"
-      | cons _ (cons _ _) =>
-          let yss := List.reify_apps ys in
-          let zs := eval cbn [List.apps List.cbn_app] in
-                             (List.apps (List.cbn_app $xss $yss)) in
-          res_rewrite '(List.reassoc_app $xss $yss $xs $ys $zs eq_refl eq_refl eq_refl)
-      | _ => anomaly "List.reify_apps returned result of unexpected shape %t" xss
-      end
-  (* TODO this should be a recursive push_down_from so that recursively created
-     occurrences of List.from are simplified/pushed down further *)
-  | List.from ?i (List.upto ?j ?l) =>
-      let r_diff := ring_simplify_res_or_nothing_to_simpl '(Z.sub $j $i) in
-      let diff := new_term r_diff in
-      if Int.lt (ring_expr_size diff) (ring_expr_size j) then
-        let pf_diff := eq_proof r_diff in
-        let rhs := '(List.upto $diff (List.from $i $l)) in
-        let lem1 := '(indexed_slice_to_sized_slice $l $i $j $diff) in
-        res_rewrite '(indexed_slice_to_sized_slice $l $i $j $diff
-                              ltac2:(bottom_up_simpl_sidecond_hook ()) $pf_diff)
-      else gfail "ring_simplify does not shrink the expression size"
-  | List.from ?i ?l =>
-      if is_concrete_enough i l true then
-        res_convertible (convertible_list_from i l)
+      if is_concrete_list xs && is_concrete_list ys then
+        (* Note: (is_concrete_list ys) is not necessary for prepend_concrete_list
+           to work, but we want to use cons only for list literals, ie. we don't
+           want lists like (e1 :: e2 :: non_concrete_tail) *)
+        res_convertible (prepend_concrete_list xs ys)
+      (* TODO also check if xs and ys are adjacent slices of the same base list *)
       else
-        match! l with
-          | List.from ?j ?ll =>
-              res_rewrite '(List.from_from $ll $j $i
-                                    ltac2:(bottom_up_simpl_sidecond_hook ())
-                                    ltac2:(bottom_up_simpl_sidecond_hook ()))
-          | _ => res_rewrite '(List.from_beginning $l $i
-                                       ltac2:(bottom_up_simpl_sidecond_hook ()))
-          | _ => res_rewrite '(List.from_pastend $l $i
-                                       ltac2:(bottom_up_simpl_sidecond_hook ()))
+        let xss := List.reify_apps_and_cons xs in
+        let yss := List.reify_apps_and_cons ys in
+        if Int.lt 2 (Int.add (constr_list_length xss) (constr_list_length yss)) then
+          let (xss', last_xs) := unsnoc_constr_list xss in
+          let (first_ys, yss') := uncons_constr_list yss in
+          let res := bottom_up_simpl_recurse '(List.app $last_xs $first_ys) in
+          let combined := new_term res in
+          let pf := eq_proof res in
+          if Int.equal 1 (constr_list_length (List.reify_apps_and_cons combined)) then
+            res_rewrite '(List.reassoc_app_mergeable_in_middle $xss' $yss'
+                            $last_xs $first_ys $combined $xs $ys _ eq_refl eq_refl $pf
+                            ltac2:(cbn[List.cbn_concat List.cbn_app]; reflexivity))
+          else
+            lazy_match! xss' with
+            | nil => gfail "nothing to simplify" (* already a right-leaning ++ *)
+            | cons _ _ => (* reassociate ((xss1 ++ .. ++ xssN) ++ (yss1 ++ .. ++ yssN))
+                             into (xss1 ++ .. ++ xssN ++ yss1 ++ .. ++ yssN) *)
+                res_rewrite '(List.reassoc_app $xss $yss $xs $ys _ eq_refl eq_refl
+                                ltac2:(cbn [List.cbn_concat List.cbn_app]; reflexivity))
+            end
+        else (* xss and yss both consist of only one listlet *)
+          gfail "nothing to simplify"
+  | @cons ?tp ?x ?xs =>
+      if is_concrete_list xs then gfail "nothing to simplify" else
+        lazy_match! xs with
+        | List.app ?xs1 ?xs2 =>
+            if is_concrete_list xs1
+            then res_convertible '(List.app (cons $x $xs1) $xs2)
+            else res_convertible '(List.app (cons $x nil) $xs)
+        | _ => res_convertible '(List.app (cons $x nil) $xs)
         end
-  (* TODO Doesn't do anything for ((xs ++ ys) ++ zs)[i:] if i points into ys,
-     and the subtraction created by from_app_discard_l should be simplified
-     immediately rather than only in the next outermost iteration *)
-  | List.from ?i (List.app ?l1 ?l2) =>
-      let ll1 := '(Z.of_nat (List.length $l1)) in
-      first_val
-        [ let sidecond := '(ltac2:(bottom_up_simpl_sidecond_hook ()): $ll1 = $i) in
-          res_rewrite '(List.from_app_eq_r $l1 $l2 $i $sidecond)
-        | let sidecond := '(ltac2:(bottom_up_simpl_sidecond_hook ()): $i <= $ll1) in
-          res_rewrite '(List.from_app_pushdown_l $l1 $l2 $i $sidecond)
-        | let sidecond := '(ltac2:(bottom_up_simpl_sidecond_hook ()): $ll1 <= $i) in
-          res_rewrite '(List.from_app_discard_l $l1 $l2 $i $sidecond) ]
   end.
 
 Ltac2 is_unary_Z_op(op: constr): bool :=
@@ -1374,6 +1960,8 @@ Ltac2 rec bottom_up_simpl(parent_kind: expr_kind)(e: constr): res :=
   let r_loc := local_simpl_hook parent_kind (new_term r_rec) in
   chain_res r_rec r_loc.
 
+Ltac2 Set bottom_up_simpl_recurse := fun e => bottom_up_simpl OtherExpr e.
+
 (* Consider `word.unsigned (foo (a + 0) ^+ x ^- foo a ^+ y)`:
    The argument of word.unsigned needs a first full bottom-up traversal to simplify
    it into `x ^+ y`, and after that, another push-down-word.unsigned traversal to
@@ -1530,8 +2118,6 @@ Ltac bottom_up_simpl_in_all := ltac2:(bottom_up_simpl_in_all ()).
 Local Hint Mode Word.Interface.word - : typeclass_instances.
 
 Section Tests.
-  Set Ltac2 Backtrace.
-
   Goal forall a: Z, a = a + 0 -> a = a + 0 -> True.
     intros ? e_nosimpl e.
     foreach_hyp (fun h t => if Ident.equal h @e_nosimpl then ()
@@ -1557,6 +2143,13 @@ Section Tests.
     | [ |- ?x = ?x ] => reflexivity
     end.
   Ltac2 Notation refl := refl0 ().
+
+  (* For debugging: hides lia proofs, so the output of `Show Proof` is more readable
+  Ltac2 Set bottom_up_simpl_sidecond_hook := fun _ =>
+      lazy_match! goal with
+      | [ |- ?g ] => eapply (@xlia $g)
+      end;
+      lia. *)
 
   Goal forall (n b: Z) (bs: list Z),
       Q (List.repeatz b (n - n) ++ bs[2/4:] ++
@@ -1660,17 +2253,10 @@ Section Tests.
     intros. bottom_up_simpl_in_goal (). refl.
   Qed.
 
-  Goal forall (T: Type) (l: list T) (a b c: T),
-      (a :: b :: c :: l)[:5] = a :: b :: c :: l[:2].
-  Proof.
-    intros. bottom_up_simpl_in_goal (). refl.
-  Succeed Qed. Abort.
-
-  Goal forall (A: Type) (l: list A) (x y z: A),
-      ([|x; y|] ++ l)[:2] ++ ([|x; y; z|] ++ l)[2:] = x :: y :: z :: l.
-  Proof.
-    intros. bottom_up_simpl_in_goal (). refl.
-  Succeed Qed. Abort.
+  Goal forall (T: Type) (l res: list T) (a b c: T),
+      res = [|a; b; c|] ++ l ->
+      a :: b :: c :: l = res.
+  Proof. intros. bottom_up_simpl_in_goal (). subst res. refl. Succeed Qed. Abort.
 
   Goal forall (a b: Z),
       0 <= a + b < 2 ^ 32 ->
@@ -1747,16 +2333,91 @@ Section Tests.
       (l1 ++ l2)[:i] = l1[:i].
   Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
 
-  Goal forall (s1: list Z),
-      0 < len s1 ->
-      s1[0] = (s1 ++ [|0|])[0].
+  Goal forall (A: Type) (l1 l2 l3: list A) (i k: Z),
+      len l1 + len l2 = i ->
+      0 <= k < len l3 ->
+      (l1 ++ l2 ++ l3[:k])[i:] = l3[:k].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (l0 l1 l2 l3 l4 l5: list bool),
+      l0 ++ ((l1 ++ l2) ++ (l3 ++ l4)) ++ l5 = l0 ++ l1 ++ l2 ++ l3 ++ l4 ++ l5.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (l1 l2 l3 res: list Z) (a b c: Z),
+      res = [|a; b; c|] ++ l1 ++ [|a; b|] ++ l2 ++ [|a; b; c|] ++ l3 ->
+      [|a; b|] ++ [|c|] ++ l1 ++ (a :: b :: l2 ++ [|a; b|]) ++ c :: l3 = res.
+  Proof. intros. bottom_up_simpl_in_goal (). subst res. refl. Succeed Qed. Abort.
+
+  Goal forall (b1 b2 b3 b4 b5: bool),
+      [|b1; b2; b3|] ++ [|b4; b5|] = [|b1; b2; b3; b4; b5|].
   Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
 
   Ltac2 Set bottom_up_simpl_sidecond_hook := fun _ =>
     (* Note/TODO: full-fledged bottom_up_simpl_in_goal for sideconditions is a bit overkill,
        we only need push_down_len *)
       bottom_up_simpl_in_goal_nop_ok ();
+      lazy_match! goal with
+      | [ |- ?g ] => eapply (@xlia $g)
+      end;
       lia.
+
+  Goal forall (T: Type) (l: list T) (a b c: T),
+      2 <= len l ->
+      (a :: b :: c :: l)[:5] = a :: b :: c :: l[:2].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (l0 l1 l2 l3: list bool) (b1 b2 b3 b4 b5: bool),
+      (l0 ++ l1 ++ [|b1; b2; b3|]) ++ (([|b4; b5|] ++ l2) ++ l3) =
+      l0 ++ l1 ++ [|b1; b2; b3; b4; b5|] ++ l2 ++ l3.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (A: Type) (l res: list A) (x y z: A),
+      res = [|x; y; z|] ++ l ->
+      ([|x; y|] ++ l)[:2] ++ ([|x; y; z|] ++ l)[2:] = res.
+  Proof. intros. bottom_up_simpl_in_goal (). subst res. refl. Succeed Qed. Abort.
+
+  Goal forall (b1 b2: bool) (l res: list bool),
+      res = [|b1; b2|] ++ l ->
+      b1 :: b2 :: l = res.
+  Proof. intros. bottom_up_simpl_in_goal (). subst res. refl. Succeed Qed. Abort.
+
+  Goal forall (b1 b2: bool) (l res: list bool),
+      res = [|b1; b2|] ++ l ->
+      b1 :: ([|b2|] ++ l) = res.
+  Proof. intros. bottom_up_simpl_in_goal (). subst res. refl. Succeed Qed. Abort.
+
+  Goal forall (b1 b2: bool) (l res: list bool),
+      res = [|b1; b2|] ++ l ->
+      (b1 :: [|b2|]) ++ l = res.
+  Proof. intros. bottom_up_simpl_in_goal_nop_ok (). subst res. refl. Succeed Qed. Abort.
+
+  Goal forall (b1 b2: bool) (l res: list bool),
+      res = [|b1; b2|] ++ l ->
+      [|b1|] ++ (b2 :: l) = res.
+  Proof. intros. bottom_up_simpl_in_goal (). subst res. refl. Succeed Qed. Abort.
+
+  Hypothesis (sort: list Z -> list Z).
+
+  Goal forall l1 l2 x (i: word),
+      len (sort l1) + 1 = \[i] + 1 ->
+      (sort l1 ++ x :: l2)[:\[i] + 1] = sort l1 ++ [|x|].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (A: Type) (l1 l2 l3: list A) (i k: Z),
+      len l1 + len l2 <= i < len l1 + len l2 + k ->
+      0 <= k < len l3 ->
+      (l1 ++ l2 ++ l3[:k])[i:] = l3[i - len l1 - len l2 : k].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (A: Type) (l1 l2 l3: list A) (i: Z),
+      len l1 + len l2 = i ->
+      (l1 ++ l2 ++ l3)[i:] = l3.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (s1: list Z),
+      0 < len s1 ->
+      s1[0] = (s1 ++ [|0|])[0].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
 
   Goal forall (l1 l2 l3: list Z) (i j k: Z),
       len l1 <= i < len l1 + j - k ->
@@ -1780,6 +2441,83 @@ Section Tests.
       l[i + j:][i - j] = l[2 * i].
   Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
 
+  (* from, i points into ys *)
+  Goal forall (xs ys zs: list bool) i,
+      len xs <= i <= len xs + len ys ->
+      ((xs ++ ys) ++ zs)[i:] = ys[i - len xs:] ++ zs.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* from, i points into ys *)
+  Goal forall (xs ys zs: list bool) i,
+      len xs <= i <= len xs + len ys ->
+      (xs ++ (ys ++ zs))[i:] = ys[i - len xs:] ++ zs.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* from, i points somewhere into (ys1 ++ ys2).
+     This example shows why only looking at one app node at a time is not enough:
+     By only looking at the app node between ys1 and ys2, we can't do anything,
+     because we don't know whether i points into the left or right part, so we
+     miss the opportunity to take the zs out. *)
+  Goal forall (ys1 ys2 zs: list bool) i,
+      0 <= i <= len ys1 + len ys2 ->
+      (ys1 ++ (ys2 ++ zs))[i:] = (ys1 ++ ys2)[i:] ++ zs.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* from, i points somewhere into (ys1 ++ ys2) *)
+  Goal forall (xs ys1 ys2 zs: list bool) i,
+      len xs <= i <= len xs + len ys1 + len ys2 ->
+      (xs ++ (ys1 ++ (ys2 ++ zs)))[i:] = (ys1 ++ ys2)[i - len xs:] ++ zs.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* make sure the new index (len xs + j - len xs) gets simplified *)
+  Goal forall (xs ys1 ys2 zs: list bool) j,
+      0 <= j <= len ys1 + len ys2 ->
+      (xs ++ (ys1 ++ (ys2 ++ zs)))[len xs + j:] = (ys1 ++ ys2)[j:] ++ zs.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* upto, i points into xs *)
+  Goal forall (xs ys zs: list bool) i,
+      0 <= i < len xs ->
+      ((xs ++ ys) ++ zs)[:i] = xs[:i].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* upto, i points into xs *)
+  Goal forall (xs ys zs: list bool) i,
+      0 <= i < len xs ->
+      (xs ++ (ys ++ zs))[:i] = xs[:i].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* upto, i points into xs2 *)
+  Goal forall (xs1 xs2 ys zs: list bool) i,
+      len xs1 <= i < len xs1 + len xs2 ->
+      (xs1 ++ (xs2 ++ (ys ++ zs)))[:i] = (xs1 ++ xs2)[:i].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  (* upto, i points somewhere into (ys1 ++ ys2) *)
+  Goal forall (xs0 xs1 ys1 ys2 zs: list bool) i expected,
+      len xs0 + len xs1 <= i <= len xs0 + len xs1 + len ys1 + len ys2 ->
+      expected = xs0 ++ xs1 ++ (ys1 ++ ys2)[:i - len xs0 - len xs1] ->
+      (xs0 ++ (xs1 ++ (ys1 ++ (ys2 ++ zs))))[:i] = expected.
+  Proof. intros. bottom_up_simpl_in_goal (). subst expected. refl. Abort.
+
+  (* push_down_from might have to chop off several lists at the start of a series of ++ *)
+  Goal forall (xs ys zs: list bool) (i j: Z),
+      0 <= i <= len xs ->
+      0 <= j <= len ys ->
+      (ys[:j] ++ (ys[j:] ++ (zs ++ xs)))[len ys:] = zs ++ xs.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (xs0 xs1 xs2 xs3 xs4: list bool) i k,
+      0 <= k <= len xs2 ->
+      len xs0 + len xs1 <= i <= len xs0 + len xs1 + k ->
+      (xs0 ++ xs1 ++ xs2[:k] ++ xs3 ++ xs4)[:i] = xs0 ++ xs1 ++ xs2[:i - len xs0 - len xs1].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (s2: list Z),
+      0 < len s2 ->
+      (s2 ++ [|0|])[1 :] = s2[1:] ++ [|0|].
+  Proof. intros. try bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
   Goal forall (s2: list Z),
       0 < len s2 ->
       (s2 ++ [|0|])[1 :][:len s2] = s2[1:] ++ [|0|].
@@ -1800,26 +2538,59 @@ Section Tests.
       (xs1 ++ xs2 ++ xs3[j:] ++ xs4[:k])[:i].
   Proof.
     intros. bottom_up_simpl_in_goal ().
-    (* TODO heuristics to decide whether it's worth pushing it down further to obtain
-       xs1 ++ xs2 ++ xs3[j:] ++ xs4[:k][:i - len xs1 - len xs2 - len x3 + j] *)
+    (* Note: The rhs gets simplified into something longer:
+       xs1 ++ xs2 ++ xs3[j:] ++ xs4[:i - len xs1 - len xs2 - len x3 + j]
+       but "clearer" in the sense that it's now obvious that the upto points into xs4 *)
     refl.
   Succeed Qed. Abort.
 
+  Goal forall (A: Type) (l1 l2: list A) (x: A) (i: Z),
+      len l1 = i ->
+      (l1 ++ [|x|] ++ l2)[:i + 1] = l1 ++ [|x|].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (A: Type) (l1 l2: list A) (x: A) (i: Z),
+      len l1 = i ->
+      (l1 ++ x :: l2)[:i + 1] = l1 ++ [|x|].
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (z i n: Z),
+      0 <= i <= n ->
+      (List.repeatz z n)[:i] = List.repeatz z i.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (z i n: Z),
+      0 <= i <= n ->
+      (List.repeatz z n)[i:] = List.repeatz z (n - i).
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (z i n: Z),
+      0 <= i <= n ->
+      (List.repeatz z n)[n - i:] = List.repeatz z i.
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (l: list bool) i j,
+      len l <= i ->
+      j <= 0 ->
+      (l[i:], l[j:], l[:i], l[:j]) = (nil, l, l, nil).
+  Proof. intros. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
+
+  Goal forall (b: bool) l n i j,
+      0 <= n <= i ->
+      j <= 0 ->
+      l = List.repeatz b n ->
+      (l[i:], l[j:], l[:i], l[:j]) = (nil, l, l, nil).
+  Proof. intros. subst l. bottom_up_simpl_in_goal (). refl. Succeed Qed. Abort.
 
   (** ** Not supported yet: *)
 
   Goal forall a b z, z = \[a ^+ b] -> /[z] = a ^+ b.
   Proof. intros. Abort.
 
-  Goal forall (A: Type) (l1 l2: list A) (x: A) (i: Z),
-      len l1 = i ->
-      (l1 ++ [|x|] ++ l2)[:i + 1] = l1 ++ [|x|].
+  Goal forall (l0 l1 l2 l3 l4: list Z) (i j: Z),
+      0 <= i + j < len l2 ->
+      (l0 ++ l1 ++ l2[:i + j]) ++ ((l2[j + i:] ++ l3) ++ l4) = l0 ++ l1 ++ l2 ++ l3 ++ l4.
   Proof. intros. bottom_up_simpl_in_goal (). Fail refl. Abort.
-
-  Goal forall (A: Type) (l1 l2: list A) (x: A) (i: Z),
-      len l1 = i ->
-      (l1 ++ x :: l2)[:i + 1] = l1 ++ [|x|].
-  Proof. intros. Fail bottom_up_simpl_in_goal (). Abort.
 
   Goal forall (z1 z2: Z) (y: word),
       word.of_Z (z1 + z2) ^- word.of_Z z1 = y ->

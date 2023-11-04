@@ -8,20 +8,7 @@ Create HintDb safe_implication.
    work, otherwise, the let-bound evars can still be unfolded by typeclass search *)
 Global Hint Variables Opaque : safe_implication.
 
-(* It's tempting to also do this:
-
 Global Hint Constants Opaque : safe_implication.
-
-but then (PredicateSize mypred) isn't unfolded to Z anymore, and many hints about
-separation logic don't apply any more. We could create an exception for it:
-
-Global Hint Transparent PredicateSize : safe_implication.
-
-But we would have to be careful that it is always imported, and would need to
-remember to also exceptions for other type aliases, so we don't do Constants Opaque
-for now.
-This problem would be resolved by https://github.com/coq/coq/issues/11536 *)
-
 
 (* Don't use Hint Mode + because it prevents typeclass search from running in
    situations where it should run: https://github.com/coq/coq/issues/18078
@@ -48,7 +35,7 @@ Ltac typeclasses_eauto_with_safe_implication :=
         | context[?x] => is_evar x; set x
         end
     end;
-  typeclasses eauto with safe_implication.
+  once (typeclasses eauto with safe_implication).
 
 Ltac safe_implication_step :=
   match goal with
@@ -60,9 +47,16 @@ Ltac safe_implication_step :=
   | |- ?Q =>
       let H := fresh in
       eassert (safe_implication _ Q) as H by typeclasses_eauto_with_safe_implication;
-      unfold safe_implication in H;
-      apply H;
-      clear H
+      lazymatch type of H with
+      | safe_implication ?p ?p =>
+          (* "fail 1000" will be swallowed by ltac2, so if that happens, we still want
+             to emit a warning, at least *)
+          idtac "Warning: There is a safe_implication hint leading to a no-progress step on" p;
+          fail 1000 "There is a safe_implication hint leading to a no-progress step on" p
+      | _ => unfold safe_implication in H;
+             apply H;
+             clear H
+      end
   end.
 
 Require Import Coq.Lists.List.
@@ -97,6 +91,12 @@ End WithMem.
   list_app_eq_r
   array_impl_from_values_eq
   : safe_implication.
+
+Global Hint Transparent PredicateSize : safe_implication.
+(* Required to make sure that (PredicateSize mypred) is unfolded to Z during type
+   unification in typeclass search, even though
+   `Global Hint Constants Opaque : safe_implication` has been set.
+   Would be resolved by https://github.com/coq/coq/issues/11536 *)
 
 Module Tests.
   Section WithMem.
