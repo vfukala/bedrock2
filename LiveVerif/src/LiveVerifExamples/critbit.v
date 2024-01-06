@@ -2263,7 +2263,7 @@ Derive cbt_delete_from_nonleaf SuchThat
   simpl cbt' in *. repeat heapletwise_step.
   (* context packaging fails if we don't `simpl cbt'` before the `if`
      because of variables being introduced too late *) .**/
-  if (((k >> load(par)) & 1) == 1) {                                       /**. .**/
+  if (((k >> deref(par)) & 1) == 1) {                                      /**. .**/
     sib = load(par + 4);                                                   /**. .**/
     cur = load(par + 8);                                                   /**. .**/
   } else {                                                                 /**. .**/
@@ -2279,13 +2279,14 @@ Derive cbt_delete_from_nonleaf SuchThat
   move R before Scope2.
 
   match goal with
-  | H1: ?mL |= cbt' skL _ _,
-    H2: ?mR |= cbt' skR _ _ |- _ =>
-    remember (if brc then mR else mL) as mcur;
-    remember (if brc then mL else mR) as msib;
-    assert (mcur |= cbt' skC (half_subcontent c brc) cur) by (destruct brc; congruence);
-    assert (msib |= cbt' skS (half_subcontent c (negb brc)) sib)
-       by (destruct brc; simpl negb; congruence)
+  | H: _ |= cbt' skL _ aL |- _ =>
+       replace skL with (if brc then skS else skC) in H by (destruct brc; congruence);
+       replace aL with (if brc then sib else cur) in H by (destruct brc; congruence)
+  end.
+  match goal with
+  | H: _ |= cbt' skR _ aR |- _ =>
+       replace skR with (if brc then skC else skS) in H by (destruct brc; congruence);
+       replace aR with (if brc then cur else sib) in H by (destruct brc; congruence)
   end.
 
   match goal with
@@ -2299,16 +2300,6 @@ Derive cbt_delete_from_nonleaf SuchThat
                          end; clear x.
   purge aL. purge aR. purge skL. purge skR.
 
-  rewrite mmap.du_comm in D. rewrite <- mmap.du_assoc in D.
-  rewrite <- mmap.du_assoc in D.
-  replace ((m2 ||| m1) ||| m3) with (m2 ||| mcur ||| msib) in D; cycle 1.
-  do 2 rewrite mmap.du_assoc. f_equal. subst mcur. subst msib.
-  destruct brc. apply mmap.du_comm. reflexivity.
-  purge m1. purge m3.
-
-  match goal with
-  | H: merge_step _ |- _ => clear H
-  end.
   match goal with
   | H: par = tp |- _ => rewrite <- H in *; rewrite H at 2; clear H
   end.
@@ -2320,21 +2311,44 @@ Derive cbt_delete_from_nonleaf SuchThat
   while (load(cur) != 32) /* initial_ghosts(c, cur, skS, sib, par, R);
     decreases skC */ {  /*?.
   repeat heapletwise_step.
-  match goal with
-  | H: _ |= cbt' _ _ cur |- _ => apply cbt_expose_fields in H
+  repeat match goal with
+  | H: _ |= cbt' _ _ _ |- _ => apply cbt_expose_fields in H
   end.
-  steps.
+  steps. clear Error.
+  remember (if brc then w2 else w0) as w2C.
+  remember (if brc then w3 else w1) as w3C.
+  remember (if brc then w0 else w2) as w2S.
+  remember (if brc then w1 else w3) as w3S.
+  repeat match goal with
+  | H: context [ w2 ] |- _ =>
+     assert_fails (idtac; match type of H with | _ = if brc then _ else _ => idtac end);
+     replace w2 with (if brc then w2C else w2S) in H by (destruct brc; congruence);
+     replace w3 with (if brc then w3C else w3S) in H by (destruct brc; congruence)
+  end.
+  repeat match goal with
+  | H: context [ w0 ] |- _ =>
+     assert_fails (idtac; match type of H with | _ = if brc then _ else _ => idtac end);
+     replace w0 with (if brc then w2S else w2C) in H by (destruct brc; congruence);
+     replace w1 with (if brc then w3S else w3C) in H by (destruct brc; congruence)
+  end.
+  purge w0. purge w1. purge w2. purge w3.
+  split. simpl seps.
+  destruct brc eqn:E; steps. steps.
   destruct skC; repeat heapletwise_step. { exfalso.
+  destruct brc; repeat heapletwise_step;
   match goal with
-  | H: half_subcontent c brc = _ |- _ => rewrite H in *
-  end.
-  unfold ready. (* `unfold ready` so that `steps` doesn't finish immediately *)
+  | H: half_subcontent c _ = _ |- _ => rewrite H in *
+  end;
   steps. } .**/
     par = cur;                                                             /**. .**/
-    if (((k >> load(par)) & 1) == 1) /* split */ {                         /**. .**/
-      sib = load(par + 4);                                                 /**. .**/
-      cur = load(par + 8);                                                 /**. .**/
+    if (((k >> load(par)) & 1) == 1) /* split */ {                         /**.
+  clear Error. split. simpl seps. destruct brc eqn:E; steps. steps. .**/
+      sib = load(par + 4);                                                 /**.
+  clear Error. split. simpl seps. destruct brc eqn:E; steps. steps. .**/
+      cur = load(par + 8);                                                 /**.
+  clear Error. split. simpl seps. destruct brc eqn:E; steps. steps. .**/
     }                                                                      /**.
+
   new_ghosts(half_subcontent c brc, _, _, _, _,
               <{ * R
                  * freeable 12 par'
@@ -2344,12 +2358,23 @@ Derive cbt_delete_from_nonleaf SuchThat
                  * <{ + uintptr /[pfx_len (pfx_mmeet c)]
                       + uintptr (if brc then sib' else par)
                       + uintptr (if brc then par else sib') }> par'
-                 * cbt' _ _ sib' }>).
-  unpurify. steps.
+                 * cbt' skS (if brc then _ else _) sib' }>).
+  steps. destruct brc eqn:E; steps; clear Error; unfold canceling; steps; simpl seps;
+  apply sep_comm; steps; clear Error; instantiate (1:=half_subcontent c (negb brc));
+  destruct skS; (simpl cbt'; steps; simpl acbt in *;
+  match goal with
+  | H: half_subcontent c _ = _ |- _ => rewrite H
+  end; steps; steps).
+
+  destruct brc; steps.
+  destruct brc; steps.
+  steps.
+
   apply eq_None_by_false. intro HnN. apply half_subcontent_get_nNone in HnN.
   apply HnN. subst brc. steps.
   clear Error. instantiate (1:=if brc then Node skS sk' else Node sk' skS).
-  unpurify. destruct brc eqn:E; simpl cbt'; steps.
+  unpurify. destruct brc eqn:E; simpl cbt'; simpl acbt in *; steps.
+
   (* TODO: below, more or less the same proof is repeated several (6) times.
            Simplify? *)
   pose proof (half_subcontent_remove_other c k true) as Hhcr. steps. rewrite Hhcr.
@@ -2382,8 +2407,10 @@ Derive cbt_delete_from_nonleaf SuchThat
   eapply (half_subcontent_extends _ false). rewrite map.remove_not_in.
   eapply acbt_nonempty. eassumption. rewrite half_subcontent_get. steps. .**/
     else {                                                                 /**. .**/
-      cur = load(par + 4);                                                 /**. .**/
-      sib = load(par + 8);                                                 /**. .**/
+      cur = load(par + 4);                                                 /**.
+  clear Error. split. simpl seps. destruct brc eqn:E; steps. steps. .**/
+      sib = load(par + 8);                                                 /**.
+  clear Error. split. simpl seps. destruct brc eqn:E; steps. steps. .**/
     }                                                                      /**.
   new_ghosts(half_subcontent c brc, _, _, _, _,
                   <{ * R
@@ -2391,7 +2418,18 @@ Derive cbt_delete_from_nonleaf SuchThat
                      * <{ + uintptr /[pfx_len (pfx_mmeet c)]
                           + uintptr (if brc then sib' else par)
                           + uintptr (if brc then par else sib') }> par'
-                     * cbt' _ _ sib' }>).
+                     * cbt' skS (if brc then _ else _) sib' }>).
+  steps. destruct brc eqn:E; steps; clear Error; unfold canceling; steps; simpl seps;
+  apply sep_comm; steps; clear Error; instantiate (1:=half_subcontent c (negb brc));
+  destruct skS; (simpl cbt'; steps; simpl acbt in *;
+  match goal with
+  | H: half_subcontent c _ = _ |- _ => rewrite H
+  end; steps; steps).
+
+  destruct brc; steps.
+  destruct brc; steps.
+  steps.
+
   (*
   Set Ltac Profiling.
   Reset Ltac Profile.
@@ -2401,7 +2439,7 @@ Derive cbt_delete_from_nonleaf SuchThat
   apply half_subcontent_get_nNone in HnN. apply HnN. subst brc. steps.
   clear Error. instantiate (1:=if brc then Node skS sk' else Node sk' skS).
 
-  destruct brc eqn:E; simpl cbt'; unpurify; steps.
+  destruct brc eqn:E; simpl cbt'; simpl acbt in *; unpurify; steps.
 
   (*
   Show Ltac Profile.
@@ -2454,31 +2492,51 @@ Derive cbt_delete_from_nonleaf SuchThat
   eapply acbt_nonempty. eassumption. rewrite half_subcontent_get. steps. .**/
   }                                                                        /**.
   destruct skC; cycle 1. { exfalso.
-  repeat match goal with
+  pose proof (pfx_len_nneg (pfx_mmeet (half_subcontent c brc))).
+  destruct brc;
+  match goal with
   | H: acbt (Node _ _) _ |- _ => apply acbt_prefix_length in H
-  end. pose proof (pfx_len_nneg (pfx_mmeet (half_subcontent c brc))). hwlia. } .**/
+  end; hwlia. } .**/
   if (load(cur + 4) == k) /* split */ {                                    /**.
+  clear Error. split. simpl seps. destruct brc eqn:E; steps;
   match goal with
   | H: _ |= cbt' _ _ sib |- _ => apply cbt_expose_fields in H
-  end. repeat heapletwise_step.
+  end. steps.
   .**/
-    cbt_raw_node_free(cur);                                                /**. .**/
-    cbt_raw_node_copy_replace(par, sib);                                   /**. .**/
-    cbt_raw_node_free(sib);                                                /**. .**/
+    cbt_raw_node_free(cur);                                                /**.
+  split. simpl seps.
+  instantiate (1:=if brc then ?[R1] else ?[R2]).
+  destruct brc eqn:E; steps.
+  unfold enable_frame_trick.enable_frame_trick. steps. .**/
+    cbt_raw_node_copy_replace(par, sib);                                   /**.
+  clear Error. split. simpl seps.
+  instantiate (4:=if brc then _ else _).
+  instantiate (3:=if brc then _ else _).
+  instantiate (2:=if brc then _ else _).
+  instantiate (1:=if brc then _ else _).
+  destruct brc eqn:E; steps.
+  unfold enable_frame_trick.enable_frame_trick. steps. .**/
+    cbt_raw_node_free(sib);                                                /**.
+  split. simpl seps.
+  instantiate (1:=if brc then ?[R1] else ?[R2]).
+  destruct brc eqn:E; steps.
+  unfold enable_frame_trick.enable_frame_trick. steps. .**/
     return 1;                                                              /**. .**/
   }                                                                        /**.
   hwlia.
   eapply map_extends_get_nnone. apply half_subcontent_extends.
+  instantiate (1:=if brc then _ else _). destruct brc; steps;
   match goal with
   | H: half_subcontent _ _ = map.singleton _ _ |- _ => rewrite H
-  end. steps.
+  end; steps.
   clear Error. instantiate (1:=skS).
   replace (map.remove c k) with (half_subcontent c (negb brc)); cycle 1.
-  { eapply half_subcontent_removed_half_leaf. eassumption. }
-  destruct skS; simpl cbt'; steps.
+  { eapply half_subcontent_removed_half_leaf.
+    destruct brc; steps; eassumption. }
+  destruct brc; destruct skS; simpl cbt'; steps;
   match goal with
-  | H: half_subcontent c (negb brc) = map.singleton _ _ |- _ => rewrite H
-  end. steps. .**/
+  | H: half_subcontent c _ = map.singleton _ _ |- _ => rewrite H
+  end; steps. .**/
   else {                                                                   /**. .**/
     return 0;                                                              /**. .**/
   }                                                                        /**.
@@ -2486,9 +2544,10 @@ Derive cbt_delete_from_nonleaf SuchThat
   match goal with
   | H: brc = bit_at _ _ |- _ => rewrite <- H in HnN
   end.
+  destruct brc; steps;
   match goal with
-  | H: half_subcontent c brc = map.singleton _ _ |- _ => rewrite H in HnN
-  end. steps. .**/
+  | H: half_subcontent c _ = map.singleton _ _ |- _ => rewrite H in HnN
+  end; steps. .**/
 }                                                                          /**.
 Qed.
 
