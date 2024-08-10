@@ -1,3 +1,42 @@
+(*Require Import Coq.Sorting.Mergesort.
+Require Import Coq.Structures.Orders.
+Require Import coqutil.Word.Interface.
+Require Import Coq.ZArith.ZArith.
+
+Module Type modw.
+  Parameter (width : Z).
+  Parameter (word : word.word width).
+  Parameter (word_ok : word.ok word).
+End modw.
+
+Module WordOrder (Import wo : modw) : Orders.TotalLeBool'.
+  (*
+  Parameter (width : Z).
+  Parameter (word : word.word width).
+  Parameter (word_ok : word.ok word).
+  *)
+  Definition t : Type := wo.word.
+  Definition leb (w1 w2 : wo.word) := orb (word.ltu w1 w2) (word.eqb w1 w2).
+  Theorem leb_total : forall w1 w2, leb w1 w2 = true \/ leb w2 w1 = true.
+  Proof.
+    intros. unfold leb. remember word. pose proof word_ok. rewrite <- Heqw in *. hwlia.
+  Qed.
+End WordOrder.
+
+Section my_sorting.
+  Context (t : Type) (leb : t -> t -> bool).
+  Context (leb_total : forall a1 a2, leb a1 a2 = true \/ leb a2 a1 = true).
+
+  Definition my_sort : list t -> list t := ... ??make use of sort from Coq.Sorting.Mergesort?? ... .
+
+Module MySort : modw.
+
+End MySort.
+
+Sort(WordOrder).
+
+Check (MySort.sort nil). *)
+
 (* -*- eval: (load-file "../LiveVerif/live_verif_setup.el"); -*- *)
 Require Import LiveVerif.LiveVerifLib.
 Require Import LiveVerifExamples.onesize_malloc.
@@ -1384,7 +1423,389 @@ Section WithMap.
     Decidable_witness := (map_size m =? 0)%nat
   }.
   Proof. rewrite Nat.eqb_eq. apply map_size_0_iff_empty. Defined.
+
+  (*
+  Lemma fold_weak_comm {R: Type} (f: R -> key -> value -> R)
+    (f_comm: forall r k1 v1 k2 v2, k1 <> k2 ->
+      f (f r k1 v1) k2 v2 = f (f r k2 v2) k1 v1)
+    : forall r0 m k v, map.get m k = None -> map.fold f (f r0 k v) m = f (map.fold f r0 m) k v.
+  Proof.
+    intros. generalize dependent H.
+      eapply map.fold_two_spec with (f1 := f) (f2 := f) (r01 := f r0 k v) (r02 := r0).
+      - reflexivity.
+      - intros. destr (key_eqb k k0). rewrite map.get_put_same in H1. discriminate.
+        rewrite map.get_put_diff in H1 by assumption. apply H0 in H1. subst. auto.
+  Qed.
+
+  Require Import Coq.Sorting.Permutation.
+
+  Lemma fold_right_change_order' {R A: Type} (f: A -> R -> R) l1
+    (f_comm: forall a1 a2 r, List.In a1 l1 -> List.In a2 l1 ->
+       f a1 (f a2 r) = f a2 (f a1 r)) :
+    forall l2: list A,
+      Permutation l1 l2 ->
+      forall r0, List.fold_right f r0 l1 = List.fold_right f r0 l2.
+  Proof.
+    induction 1; intros.
+    - reflexivity.
+    - simpl in *. f_equal. auto.
+    - simpl in *. apply f_comm; auto.
+    - rewrite IHPermutation1, IHPermutation2
+        by (eauto 6 using Permutation_in, Permutation_sym). reflexivity.
+  Qed.
+
+  Lemma fold_put_strong {R: Type} (f: R -> key -> value -> R)
+    (f_comm: forall r k1 v1 k2 v2, k1 <> k2 -> f (f r k1 v1) k2 v2 = f (f r k2 v2) k1 v1)
+    : forall r0 m k v,
+      map.get m k = None ->
+      map.fold f r0 (map.put m k v) = f (map.fold f r0 m) k v.
+  Proof.
+    intros. do 2 rewrite map.fold_to_tuples_fold.
+    match goal with
+    | |- ?L = f (List.fold_right ?F r0 (map.tuples m)) k v =>
+      change (L = List.fold_right F r0 (cons (k, v) (map.tuples m)))
+    end.
+    apply fold_right_change_order'.
+    - intros [k1 v1] [k2 v2] r Hin1 Hin2. destr (key_eqb k1 k2).
+      + rewrite map.tuples_spec in *. congruence.
+      + auto.
+    - apply NoDup_Permutation.
+      + apply map.tuples_NoDup.
+      + constructor.
+        * pose proof (map.tuples_spec m k v). intuition congruence.
+        * apply map.tuples_NoDup.
+      + intros [k0 v0].
+        rewrite (map.tuples_put m k v H).
+        reflexivity.
+  Qed.
+
+  Lemma fold_comm_spec {R: Type} : forall (P: map -> R -> Prop) f r0,
+    P map.empty r0 ->
+    (* would ideally want to quantify over (fold m) instead of arbitrary r *)
+    (forall r k1 v1 k2 v2, k1 <> k2 -> f (f r k1 v1) k2 v2 = f (f r k2 v2) k1 v1) ->
+        (forall k v m r, map.get m k = None -> P m r -> P (map.put m k v) (f r k v)) ->
+        forall m, P m (map.fold f r0 m).
+  Proof.
+    intros. eapply proj2.
+    eapply map.fold_spec with (P:=fun m r => r = map.fold f r0 m /\ P m r).
+    - rewrite map.fold_empty. auto.
+    - intros. destruct_products. subst. split.
+      + symmetry. auto using fold_put_strong.
+      + eauto.
+  Qed.
+  *)
 End WithMap.
+
+Require Import coqutil.Macros.unique coqutil.Map.SortedList.
+
+Section WithMapOrder.
+  (*Context {key value : Type} {map : map.map key value} {map_ok : map.ok map}.*)
+  (* Context {key_eqb: key -> key -> bool} {key_eq_dec: EqDecider key_eqb}. *)
+  Context {p : unique! parameters} {ok : parameters.strict_order parameters.ltb}.
+  Context {map : map.map parameters.key parameters.value} {map_ok : map.ok map}.
+
+  Notation eqb := SortedList.eqb.
+  Notation ltb := parameters.ltb.
+
+  Definition leb k1 k2 := negb (ltb k2 k1).
+
+  Lemma put_new_length l k v
+    : lookup l k = None -> List.length (put l k v) = S (List.length l).
+  Proof.
+    intro Hnon. induction l as [ | [ k' v' ] l ]; [ reflexivity | ]. simpl.
+    destruct (ltb k k') eqn:E1; [ simpl; lia | ]. rewrite lookup_cons in Hnon.
+    unfold SortedList.eqb in Hnon. rewrite E1 in Hnon. destruct (ltb k' k) eqn:E2.
+    - simpl in *. apply IHl in Hnon. congruence.
+    - simpl in Hnon. discriminate.
+  Qed.
+
+  (*
+  Lemma put_new_len l k v : lookup l k = None -> len (put l k v) = len l + 1.
+  Proof.
+    intro Hnon. induction l as [ | [ k' v' ] l ]; [ reflexivity | ]. simpl.
+    destruct (ltb k k') eqn:E1; [ simpl; lia | ]. rewrite lookup_cons in Hnon.
+    unfold SortedList.eqb in Hnon. rewrite E1 in Hnon. destruct (ltb k' k) eqn:E2.
+    - simpl in *. apply IHl in Hnon. lia.
+    - simpl in Hnon. discriminate.
+  Qed.
+  *)
+
+  Definition map_to_sorted_list := map.fold put nil.
+  (* --> coqutil.Map.SortedList *)
+
+  Lemma map_to_sorted_list_empty : map_to_sorted_list map.empty = nil.
+  Proof. apply map.fold_empty. Qed.
+
+  Lemma map_to_sorted_list_sorted m : sorted (map_to_sorted_list m) = true.
+  Proof. unfold map_to_sorted_list. eapply map.fold_spec; eauto using sorted_put. Qed.
+
+  Lemma lookup_put_same l k v (Hsrt : sorted l = true) : lookup (put l k v) k = Some v.
+  Proof.
+    induction l as [ | [ k' v' ] l ]; simpl.
+    - rewrite lookup_cons, eqb_refl. reflexivity.
+    - destruct (ltb k k').
+      + rewrite lookup_cons, eqb_refl. reflexivity.
+      + destruct (ltb k' k) eqn:E; rewrite lookup_cons.
+        * unfold SortedList.eqb.
+          rewrite E, Bool.andb_false_r. apply IHl. apply sorted_cons in Hsrt. tauto.
+        * rewrite eqb_refl. reflexivity.
+  Qed.
+
+  Lemma lookup_put_diff l k v k'' (Hsrt : sorted l = true) (Hneq : eqb k'' k = false)
+    : lookup (put l k v) k'' = lookup l k''.
+  Proof.
+    induction l as [ | [ k' v' ] l ]; simpl.
+    - rewrite lookup_cons, Hneq. reflexivity.
+    - destruct (ltb k k') eqn:E1.
+      + rewrite lookup_cons, Hneq. reflexivity.
+      + destruct (ltb k' k) eqn:E2; rewrite 2lookup_cons.
+        * rewrite IHl; [ reflexivity | ]. apply sorted_cons in Hsrt. tauto.
+        * destruct ok. specialize (ltb_total _ _ E1 E2). subst. rewrite Hneq.
+          reflexivity.
+  Qed.
+
+  Lemma lookup_get m : forall k, lookup (map_to_sorted_list m) k = map.get m k.
+  Proof.
+    apply (@proj2 (sorted (map_to_sorted_list m) = true)). unfold map_to_sorted_list.
+    eapply map.fold_spec; intros; (split; [ intuition (eauto using sorted_put) | ]).
+    - intros. rewrite map.get_empty. auto.
+    - intros. destruct_products. destruct (eqb k0 k) eqn:E.
+      + apply eqb_true in E. subst k0. rewrite map.get_put_same.
+        auto using lookup_put_same.
+      + rewrite map.get_put_diff by (apply eqb_false; assumption).
+        eauto using eq_trans, lookup_put_diff.
+  Qed.
+
+  Lemma map_to_sorted_list_length m : List.length (map_to_sorted_list m) = map_size m.
+  Proof.
+    intros. apply (@proj2 (sorted (map_to_sorted_list m) = true /\
+      forall k, lookup (map_to_sorted_list m) k = map.get m k)).
+    unfold map_to_sorted_list, map_size.
+    match goal with
+    | |- _ /\ Datatypes.length ?fl1 = ?fl2 => pattern m, fl1, fl2
+    end.
+    apply map.fold_two_spec.
+    - split; [ split; [ | intro; rewrite map.get_empty ] | ]; reflexivity.
+    - intros. destruct_products. split; [ split | ].
+      + eauto using sorted_put.
+      + intro k'. destruct (eqb k' k) eqn:E.
+        * apply eqb_true in E. subst k'. rewrite map.get_put_same.
+          auto using lookup_put_same.
+        * rewrite lookup_put_diff by assumption. apply eqb_false in E.
+          rewrite map.get_put_diff; auto.
+      + rewrite put_new_length. congruence. eauto using eq_trans.
+  Qed.
+
+  Lemma map_to_sorted_list_len m : len (map_to_sorted_list m) = Z.of_nat (map_size m).
+  Proof. pose proof (map_to_sorted_list_length m). lia. Qed.
+  (*
+    intros. apply (@proj2 (sorted (map_to_sorted_list m) = true /\
+      forall k, lookup (map_to_sorted_list m) k = map.get m k)).
+    unfold map_to_sorted_list, map_size.
+    match goal with
+    | |- _ /\ len ?fl1 = _ ?fl2 => pattern m, fl1, fl2
+    end.
+    apply map.fold_two_spec.
+    - split; [ split; [ | intro; rewrite map.get_empty ] | ]; reflexivity.
+    - intros. destruct_products. split; [ split | ].
+      + eauto using sorted_put.
+      + intro k'. destruct (eqb k' k) eqn:E.
+        * apply eqb_true in E. subst k'. rewrite map.get_put_same.
+          auto using lookup_put_same.
+        * rewrite lookup_put_diff by assumption. apply eqb_false in E.
+          rewrite map.get_put_diff; auto.
+      + rewrite put_new_len. lia. eauto using eq_trans.
+  Qed. *)
+
+  Lemma map_to_sorted_list_nil_inv (m : map)
+    : map_to_sorted_list m = nil -> m = map.empty.
+  Proof.
+    intros Hnil. apply map_size_0_empty. rewrite <- map_to_sorted_list_length, Hnil.
+    reflexivity.
+  Qed.
+
+  Definition map_min_tuple (m : map) := List.hd_error (map_to_sorted_list m).
+
+  Lemma map_min_tuple_in (m : map) k v
+    : map_min_tuple m = Some (k, v) -> map.get m k = Some v.
+  Proof.
+    intro Hmts. rewrite <- lookup_get. unfold map_min_tuple, List.hd_error in *.
+    destruct (map_to_sorted_list m) as [ | [ k' v' ] ]. discriminate. injection Hmts.
+    intros. subst. rewrite lookup_cons. rewrite eqb_refl. reflexivity.
+  Qed.
+
+  Lemma list_hd_error_None_inv [ A : Type ] (l : list A)
+    : List.hd_error l = None -> l = nil.
+  Proof. destruct l; intuition discriminate. Qed.
+
+  Lemma list_find_unique [ A : Type ] f (l : list A) a
+    (Hin: List.In a l) (Hf: f a = true)
+    (Huq: List.Forall (fun a' => f a' = true -> a' = a) l)
+    : List.find f l = Some a.
+  Proof.
+    induction l as [ | aa l ].
+    - contradict Hin.
+    - destruct Hin; simpl.
+      + subst. rewrite Hf. reflexivity.
+      + apply List.invert_Forall_cons in Huq. destruct_products.
+        destruct (f aa); intuition congruence.
+  Qed.
+
+  Lemma map_min_tuple_None_empty (m : map) : map_min_tuple m = None -> m = map.empty.
+  Proof. auto using list_hd_error_None_inv, map_to_sorted_list_nil_inv. Qed.
+
+  Require Import coqutil.Tactics.Simp.
+
+  Lemma lookup_None_no_In l k (Hnone: lookup l k = None) v : ~List.In (k, v) l.
+  Proof.
+    intro Hin. unfold lookup in Hnone.
+    match goal with
+    | H: context [ match ?e with _ => _ end ] |- _ => destruct e as [ [k' v'] | ] eqn:E
+    end.
+    discriminate. eapply List.find_none in E. 2: eassumption. rewrite eqb_refl in E.
+    discriminate.
+  Qed.
+
+  Lemma sorted_unique_keys l (Hsrt: sorted l = true) k v1 v2
+    (Hin1: List.In (k, v1) l) (Hin2: List.In (k, v2) l) : v1 = v2.
+  Proof.
+    induction l as [ | [k' v'] l]. contradict Hin1. apply sorted_cons in Hsrt.
+    destruct_products. specialize (IHl Hsrtl). destruct Hin1, Hin2; simp; auto; exfalso;
+    eapply lookup_None_no_In in Hsrtrl; eauto.
+  Qed.
+
+  Lemma sorted_In_lookup (l : list (parameters.key * parameters.value)) k v
+    (Hsrt: sorted l = true) : List.In (k, v) l <-> lookup l k = Some v.
+  Proof.
+    unfold lookup. split; [ intro Hin | intro Hlk ].
+    - unfold lookup. rewrite list_find_unique with (a:=(k, v)); auto using eqb_refl.
+      apply List.Forall_forall. intros [k' v']. intros Hin' Heq. simpl in Heq.
+      apply eqb_true in Heq. subst. f_equal. eauto using sorted_unique_keys.
+    - match goal with
+      | H: context [ match ?e with _ => _ end ] |- _ => destruct e as [ [k' v'] | ] eqn:E
+      end; [ | discriminate ]. simp. apply List.find_some in E. destruct_products.
+      simpl in Er. apply eqb_true in Er. congruence.
+  Qed.
+
+  Lemma sorted_nth_lt (l : list (parameters.key * parameters.value)) i1 i2 :
+    sorted l = true ->
+    (i1 < i2)%nat ->
+    forall k1 v1 k2 v2,
+      List.nth_error l i1 = Some (k1, v1) ->
+      List.nth_error l i2 = Some (k2, v2) ->
+      ltb k1 k2 = true.
+  Proof.
+    intro Hsrt. generalize dependent i2. generalize dependent i1.
+    induction l as [ | [ k v ] l ].
+    - intros. rewrite List.nth_error_nil in *. discriminate.
+    - apply sorted_cons in Hsrt. destruct_products. intros ? ? ? ? ? ? ? Hnth1 Hnth2.
+      destruct i2. lia. destruct i1; simpl in Hnth1, Hnth2.
+      + simp. apply List.nth_error_In, sorted_In_lookup in Hnth2.
+        2: assumption. destruct (ltb k1 k2) eqn:Hc. reflexivity. exfalso.
+        destruct ok. apply ltb_total in Hc. congruence. destruct (ltb k2 k1) eqn:Hcc.
+        apply Hsrtrr in Hcc. congruence. reflexivity.
+      + specialize (IHl Hsrtl i1 i2). specialize_hyp IHl. lia. eauto.
+  Qed.
+
+  Lemma ltb_leb k1 k2 : ltb k1 k2 = true -> leb k1 k2 = true.
+  Proof.
+    intro Hltb. unfold leb. destruct ok. destruct (ltb k2 k1) eqn:E.
+    - eapply ltb_trans in E. 2: eassumption. rewrite ltb_antirefl in E. discriminate.
+    - reflexivity.
+  Qed.
+
+  Lemma map_min_tuple_key_le (m : map) k v k'
+    : map_min_tuple m = Some (k, v) -> map.get m k' <> None -> leb k k' = true.
+  Proof.
+    intros Htup Hget. unfold map_min_tuple in Htup. rewrite <- lookup_get in Hget.
+    destruct (lookup (map_to_sorted_list m) k') as [v' | ] eqn:E; [ | tauto ].
+    rewrite <- sorted_In_lookup in E by (apply map_to_sorted_list_sorted).
+    apply List.In_nth_error in E. destruct E as [ i E ].
+    rewrite <- List.nth_error_O in Htup. destruct i.
+    - assert (k = k') by congruence. subst. unfold leb. destruct ok.
+      rewrite ltb_antirefl. reflexivity.
+    - apply ltb_leb. eapply sorted_nth_lt; try eassumption.
+      apply map_to_sorted_list_sorted. lia.
+  Qed.
+
+  Lemma map_min_tuple_eq (m : map) k v (Hget: map.get m k = Some v)
+    (Hleb: forall k', map.get m k' <> None -> leb k k' = true)
+    : map_min_tuple m = Some (k, v).
+  Proof.
+    rewrite <- lookup_get, <- sorted_In_lookup in Hget
+      by (apply map_to_sorted_list_sorted). apply List.In_nth_error in Hget.
+    destruct Hget as [i Hget]. decide (i = O).
+    - subst. rewrite List.nth_error_O in Hget. assumption.
+    - destruct (map_min_tuple m) as [[k' v']| ] eqn:E.
+      + eassert (Hin: _). { apply map_min_tuple_in. eassumption. }
+        unfold map_min_tuple in E. rewrite <- List.nth_error_O in E.
+        eassert (Hlt: _). { eapply sorted_nth_lt. 3: exact E. 3: exact Hget.
+          apply map_to_sorted_list_sorted. lia. }
+        eassert (Hle: _). { eapply Hleb. rewrite Hin. discriminate. } unfold leb in *.
+        rewrite Hlt in Hle. simpl in Hle. discriminate.
+      + apply map_min_tuple_None_empty in E. subst.
+        rewrite map_to_sorted_list_empty, List.nth_error_nil in Hget. discriminate.
+  Qed.
+
+  Definition map_take_ge (m : map) k := map_filter_by_key m (leb k).
+  Definition map_take_gt (m : map) k := map_filter_by_key m (ltb k).
+
+  Lemma map_take_ge_empty k : map_take_ge map.empty k = map.empty.
+  Proof. apply map_filter_by_key_empty. Qed.
+
+  Instance eqdec : EqDecider eqb.
+  Proof.
+    intros k1 k2. destruct (eqb k1 k2) eqn:E;
+    [ apply BoolSpecT, eqb_true | apply BoolSpecF, eqb_false ]; assumption.
+  Qed.
+
+  Lemma map_take_ge_get_ge m k k' (Hleb: leb k k' = true)
+    : map.get (map_take_ge m k) k' = map.get m k'.
+  Proof.
+    apply map_filter_by_key_get_true. assumption.
+  Qed.
+
+  Lemma map_take_ge_eq_empty m k
+    (Hltb: forall k', map.get m k' <> None -> ltb k' k = true)
+    : map_take_ge m k = map.empty.
+  Proof. apply map_filter_by_key_eq_empty. unfold leb. intros. rewrite Hltb; auto. Qed.
+
+  Lemma map_take_ge_get_not_None m k k' (Hnn: map.get (map_take_ge m k) k' <> None)
+    : leb k k' = true.
+  Proof. apply map_filter_by_key_get_not_None_true in Hnn. assumption. Qed.
+
+  Lemma map_take_ge_get_not_None' m k k' (Hleb: leb k k' = true)
+    (Hnn: map.get m k' <> None)
+    : map.get (map_take_ge m k) k' <> None.
+  Proof. rewrite map_take_ge_get_ge; assumption. Qed.
+
+  Lemma map_take_ge_monotone m m' k (Hext: map.extends m m')
+    : map.extends (map_take_ge m k) (map_take_ge m' k).
+  Proof. apply map_filter_by_key_monotone. assumption. Qed.
+
+  Lemma map_take_ge_extends m k : map.extends m (map_take_ge m k).
+  Proof. apply map_filter_by_key_extends. Qed.
+
+  Lemma map_min_tuple_take_ge_has_min m k v (Hget: map.get m k = Some v)
+    : map_min_tuple (map_take_ge m k) = Some (k, v).
+  Proof.
+    apply map_min_tuple_eq.
+    - rewrite map_take_ge_get_ge; [ assumption | ]. unfold leb. destruct ok.
+      rewrite ltb_antirefl. reflexivity.
+    - intros k' Hget'. eauto using map_take_ge_get_not_None.
+  Qed.
+
+  Lemma map_take_gt_get_gt m k k' (Hltb: ltb k k' = true)
+    : map.get (map_take_gt m k) k' = map.get m k'.
+  Proof. apply map_filter_by_key_get_true. assumption. Qed.
+
+  Lemma map_take_gt_extends m k : map.extends m (map_take_gt m k).
+  Proof. apply map_filter_extends. Qed.
+
+  Lemma map_take_gt_get_not_None m k k' (Hnn: map.get (map_take_gt m k) k' <> None)
+    : ltb k k' = true.
+  Proof. apply map_filter_by_key_get_not_None_true in Hnn. assumption. Qed.
+End WithMapOrder.
 
 Context {word_map: map.map word word}.
 Context {word_map_ok: map.ok word_map}.
@@ -2751,7 +3172,7 @@ Derive critical_bit SuchThat (fun_correct! critical_bit) As critical_bit_ok.    
   move i at bottom. .**/
   while (i < 8 * sizeof(uintptr_t) - 1
     && ((k1 >> (8 * sizeof(uintptr_t) - 1 - i) & 1)
-          == ((k2 >> (8 * sizeof(uintptr_t) - 1 - i) & 1))))
+          == (k2 >> (8 * sizeof(uintptr_t) - 1 - i) & 1)))
     /* decreases (ltac:(bw) - \[i]) */ {                                   /**. .**/
     i = i + 1;                                                             /**. .**/
   }                                                                        /**.
@@ -3939,6 +4360,7 @@ Proof.
   intros. eapply pfx_le_emb_bit_same_prefix; try eassumption; steps.
 Qed.
 
+(*
 Definition map_take_ge (c : word_map) k :=
   map_filter_by_key c (fun k' => \[k] <=? \[k']).
 Definition map_take_gt (c : word_map) k :=
@@ -3986,7 +4408,9 @@ Lemma map_take_ge_extends : forall c k,
 Proof.
   unfold map_take_ge. auto using map_filter_by_key_extends.
 Qed.
+*)
 
+(*
 Definition map_min_key_value (c: word_map) : option (word * word) := map.fold
   (fun cur k v => match cur with
                   | Some (k', _) => if \[k] <? \[k'] then Some (k, v) else cur
@@ -4066,10 +4490,30 @@ Proof.
   - rewrite map_take_ge_get_ge; steps.
   - intros k' Hink'. eauto using map_take_ge_get_nnone.
 Qed.
+*)
 
 Lemma some_not_none : forall (X : Type) (x : X) o, o = Some x -> o <> None.
 Proof.
   intros. destruct o; [ intro | ]; discriminate.
+Qed.
+
+Instance word_order : parameters.parameters := {
+  key := word;
+  value := word;
+  ltb := word.ltu
+}.
+
+#[refine]
+Instance word_order_ok : parameters.strict_order word.ltu := {}.
+Proof. all: intros; hwlia. Qed.
+
+Instance word_ltb_spec k k' : BoolSpec (\[k] < \[k']) (\[k'] <= \[k]) (parameters.ltb k k').
+Proof. unfold parameters.ltb. simpl. apply word.ltu_spec. Qed.
+
+Instance word_leb_spec k k' : BoolSpec (\[k] <= \[k']) (\[k'] < \[k]) (leb k k').
+Proof.
+  unfold leb. apply negb_BoolSpec. unfold parameters.ltb. simpl.
+  destruct (word.ltu k' k) eqn:E; constructor; hwlia.
 Qed.
 
 #[export] Instance spec_of_cbt_next_ge_impl_uptrace: fnspec :=                .**/
@@ -4098,7 +4542,7 @@ void cbt_next_ge_impl_uptrace(uintptr_t tp, uintptr_t k, uintptr_t i,
   ensures t' m' := t' = t
            /\ <{ * cbt' sk c tp
                  * (EX k_res v_res,
-                    <{ * emp (map_min_key_value (map_take_ge c k) = Some (k_res, v_res))
+                    <{ * emp (map_min_tuple (map_take_ge c k) = Some (k_res, v_res))
                        * uintptr k_res key_out
                        * uintptr v_res val_out }>)
                  * R }> m' #**/                                            /**.
@@ -4137,18 +4581,19 @@ Derive cbt_next_ge_impl_uptrace SuchThat (fun_correct! cbt_next_ge_impl_uptrace)
   { simpl cbt_lookup_trace in *. steps.
     rewrite set_bit_at_bit_at_diff_ix in * by steps. steps. }
   simpl cbt'. clear Error. steps.
-  { apply map_min_key_value_eq.
+  { apply map_min_tuple_eq.
     - match goal with
-      | H: map_min_key_value _ = Some _ |- _ => apply map_min_key_value_in in H
+      | H: map_min_tuple _ = Some _ |- _ => apply map_min_tuple_in in H
       end.
       eauto using map_take_ge_monotone, map.extends_get, half_subcontent_extends.
     - intros k' Hink'. destruct (bit_at k' (pfx_len (pfx_mmeet c))) eqn:E.
-      + eapply map_min_key_value_key_le; [ eassumption | ].
-        apply map_take_ge_get_nnone'.
-        * eauto using map_take_ge_get_nnone.
+      + eapply map_min_tuple_key_le; [ eassumption | ].
+        apply map_take_ge_get_not_None'.
+        * eauto using map_take_ge_get_not_None.
         * rewrite <- E. apply half_subcontent_get_nNone.
           eauto using map_extends_get_not_None, map_take_ge_extends.
-      + exfalso. enough (\[k'] < \[k]) by (apply map_take_ge_get_nnone in Hink'; lia).
+      + exfalso. enough (\[k'] < \[k]). { apply map_take_ge_get_not_None in Hink'.
+          unfold leb, parameters.ltb in Hink'. simpl in Hink'. hwlia. }
         eapply bit_at_lt with (i:=pfx_len (pfx_mmeet c)); steps.
         transitivity (bit_at (cbt_best_lookup sk2 (half_subcontent c true) k) j).
         * assert (pfx_len (pfx_mmeet c)
@@ -4181,26 +4626,29 @@ Derive cbt_next_ge_impl_uptrace SuchThat (fun_correct! cbt_next_ge_impl_uptrace)
   { simpl cbt_lookup_trace in *. steps.
     rewrite set_bit_at_bit_at_diff_ix in * by steps. steps. }
   simpl cbt'. clear Error. steps.
-  { apply map_min_key_value_eq.
-    - eauto using map_take_ge_monotone, map_min_key_value_in, map.extends_get,
+  { apply map_min_tuple_eq.
+    - eauto using map_take_ge_monotone, map_min_tuple_in, map.extends_get,
                   half_subcontent_extends.
     - intros k' Hink'. destruct (bit_at k' (pfx_len (pfx_mmeet c))) eqn:E.
-      + eapply bit_at_le with (i:=pfx_len (pfx_mmeet c)); steps.
+      + enough (\[k_res] <= \[k']). { unfold leb, parameters.ltb. simpl. hwlia. }
+        eapply bit_at_le with (i:=pfx_len (pfx_mmeet c)); steps.
         assert (pfx_len (pfx_mmeet c) <=
                   pfx_len (pfx_meet (pfx_emb k_res) (pfx_emb k'))).
         { apply pfx_le_len. apply pfx_meet_le_both. apply pfx_mmeet_key_le.
           eapply map_extends_get_not_None. apply (half_subcontent_extends _ false).
-          eapply map_extends_get_not_None. apply map_take_ge_extends.
-          erewrite map_min_key_value_in; [ | eassumption ]. steps.
+          eapply map_extends_get_not_None. apply map_take_ge_extends with (k:=k).
+          eapply some_not_none. eapply @map_min_tuple_in with (p:=word_order).
+          all: eauto with typeclass_instances. (* FIXME: clumsy *)
           eauto using pfx_mmeet_key_le, map_extends_get_not_None, map_take_ge_extends. }
         apply pfx_meet_emb_bit_at_eq. lia.
         match goal with
-        | H: map_min_key_value _ = Some _ |- _ => apply map_min_key_value_in in H
+        | H: map_min_tuple _ = Some _ |- _ => apply map_min_tuple_in in H
         end.
         apply half_subcontent_in_bit. eapply some_not_none.
         eauto using map_take_ge_extends, map.extends_get.
-      + eapply map_min_key_value_key_le; [ eassumption | ]. apply map_take_ge_get_nnone'.
-        eauto using map_take_ge_get_nnone.
+      + eapply map_min_tuple_key_le; [ eassumption | ].
+        apply map_take_ge_get_not_None'.
+        eauto using map_take_ge_get_not_None.
         rewrite <- E. apply half_subcontent_get_nNone.
         eauto using map_extends_get_not_None, map_take_ge_extends. } .**/
   }                                                                        /**.
@@ -4210,9 +4658,10 @@ Derive cbt_next_ge_impl_uptrace SuchThat (fun_correct! cbt_next_ge_impl_uptrace)
   cbt_get_min_impl(tp, key_out, val_out);                                  /**. .**/
 }                                                                          /**.
   simpl cbt'. clear Error. steps.
-  { apply map_min_key_value_eq. rewrite map_take_ge_get_ge.
+  { apply map_min_tuple_eq. rewrite map_take_ge_get_ge.
     - eauto using map.extends_get, half_subcontent_extends.
-    - apply bit_at_le with (i:=pfx_len (pfx_mmeet c)); steps.
+    - enough (\[k] <= \[k1]). { unfold leb, parameters.ltb. simpl. hwlia. }
+      apply bit_at_le with (i:=pfx_len (pfx_mmeet c)); steps.
       + transitivity (bit_at (cbt_best_lookup (Node sk1 sk2) c k) j).
         * apply pfx_meet_emb_bit_at_eq. lia.
         * apply pfx_meet_emb_bit_at_eq.
@@ -4226,7 +4675,9 @@ Derive cbt_next_ge_impl_uptrace SuchThat (fun_correct! cbt_next_ge_impl_uptrace)
             apply (half_subcontent_extends _ true). steps. }
           apply pfx_le_len in Hpfxle. steps.
       + rewrite half_subcontent_get in *. steps.
-    - intros k' Hink'. destruct (bit_at k' (pfx_len (pfx_mmeet c))) eqn:E.
+    - intros k' Hink'. enough (\[k1] <= \[k']).
+      { unfold leb, parameters.ltb. simpl. hwlia. }
+      destruct (bit_at k' (pfx_len (pfx_mmeet c))) eqn:E.
       + apply_forall. rewrite <- E.
         eauto using half_subcontent_get_nNone, map_extends_get_not_None,
                     map_take_ge_extends.
@@ -4237,8 +4688,8 @@ Derive cbt_next_ge_impl_uptrace SuchThat (fun_correct! cbt_next_ge_impl_uptrace)
                     map_take_ge_extends. }
           match goal with
           | H: map.get (map_take_ge _ _) _ <> None |- _ =>
-               apply map_take_ge_get_nnone in H
-          end. lia.
+               apply map_take_ge_get_not_None in H
+          end. unfold leb, parameters.ltb in Hink'. simpl in Hink'. hwlia.
         * apply bit_at_lt with (i:=cb). { steps. } steps.
           transitivity (bit_at (cbt_best_lookup sk1 (half_subcontent c false) k) j).
           { eapply cbt_trace_fixes_prefix with
@@ -4313,12 +4764,12 @@ Qed.
 
 Create HintDb content_maps.
 
-Hint Resolve map_take_ge_get_nnone map_take_ge_get_nnone'
+Hint Resolve map_take_ge_get_not_None map_take_ge_get_not_None'
              map_take_ge_monotone map_take_ge_extends
              half_subcontent_extends
              map.extends_get map_extends_get_not_None
              half_subcontent_get_nNone
-             map_min_key_value_in
+             map_min_tuple_in
              some_not_none
   : content_maps.
 
@@ -4339,7 +4790,7 @@ void cbt_next_ge_impl_at_cb(uintptr_t tp, uintptr_t k, uintptr_t cb,
   ensures t' m' := t' = t
            /\ <{ * cbt' sk c tp
                  * (EX k_res v_res,
-                    <{ * emp (map_min_key_value (map_take_ge c k) = Some (k_res, v_res))
+                    <{ * emp (map_min_tuple (map_take_ge c k) = Some (k_res, v_res))
                        * uintptr k_res key_out
                        * uintptr v_res val_out }>)
                  * R }> m' #**/                                            /**.
@@ -4366,18 +4817,27 @@ Derive cbt_next_ge_impl_at_cb SuchThat (fun_correct! cbt_next_ge_impl_at_cb)
             + uintptr tp }> tp'
        * R }>).
   steps; simpl cbt_best_lookup in *; try steps.
-  { clear Error. simpl cbt'. steps. apply map_min_key_value_eq.
-    - eauto with content_maps.
+  { clear Error. simpl cbt'. steps. apply map_min_tuple_eq.
+    - eapply map.extends_get. apply map_min_tuple_in. eassumption.
+      simple apply map_take_ge_monotone. eauto with content_maps.
     - intros k' Hink'. destruct (bit_at k' (pfx_len (pfx_mmeet c))) eqn:E.
-      + eapply map_min_key_value_key_le; [ eassumption | ].
-        apply map_take_ge_get_nnone'.
-        * eauto with content_maps.
-        * rewrite <- E. eauto with content_maps.
-      + exfalso. enough (\[k'] < \[k]) by (apply map_take_ge_get_nnone in Hink'; lia).
+      + eapply map_min_tuple_key_le; [ eassumption | ].
+        apply map_take_ge_get_not_None'.
+        * eapply map_take_ge_get_not_None. eassumption.
+        * rewrite <- E. apply half_subcontent_get_nNone.
+          eapply map_extends_get_not_None. 2: eassumption.
+          eapply @map_take_ge_extends with (p:=word_order).
+          all: eauto with typeclass_instances.
+      + exfalso. enough (\[k'] < \[k]).
+        { apply map_take_ge_get_not_None in Hink'. unfold leb, parameters.ltb in Hink'.
+          simpl in Hink'. hwlia. }
         apply bit_at_lt with (pfx_len (pfx_mmeet c)); steps.
         transitivity (bit_at (cbt_best_lookup (Node sk1 sk2) c k) j).
         * apply pfx_le_emb_bit_same_prefix with (pfx_mmeet c); steps.
-          apply pfx_mmeet_key_le. eauto with content_maps.
+          apply pfx_mmeet_key_le.
+          eapply map_extends_get_not_None. 2: eassumption.
+          eapply @map_take_ge_extends with (p:=word_order).
+          all: eauto with typeclass_instances.
           apply pfx_mmeet_key_le. steps.
         * simpl cbt_best_lookup. steps. apply pfx_meet_emb_bit_at_eq.
         rewrite pfx_meet_comm. lia. } .**/
@@ -4392,13 +4852,26 @@ Derive cbt_next_ge_impl_at_cb SuchThat (fun_correct! cbt_next_ge_impl_at_cb)
             + uintptr w3 }> tp'
        * R }>). steps; simpl cbt_best_lookup in *; try steps.
   { clear Error. simpl cbt'. steps.
-    apply map_min_key_value_eq.
-    - eauto with content_maps.
+    apply map_min_tuple_eq.
+    - eapply map.extends_get. apply map_min_tuple_in. eassumption.
+      simple apply map_take_ge_monotone. eauto with content_maps.
     - intros k' Hink'. destruct (bit_at k' (pfx_len (pfx_mmeet c))) eqn:E.
-      + apply half_subcontent_in_false_true_le with (c:=c); steps;
-        eauto with content_maps.
-      + eapply map_min_key_value_key_le; [ eassumption | ]. rewrite <- E.
-        eauto with content_maps. } .**/
+      + enough (\[k_res] <= \[k']). { unfold leb, parameters.ltb. simpl. hwlia. }
+        apply half_subcontent_in_false_true_le with (c:=c); steps.
+        * eapply map_extends_get_not_None.
+          2: eapply some_not_none; eapply @map_min_tuple_in with (p:=word_order).
+          all: eauto with typeclass_instances.
+          eapply @map_take_ge_extends with (p:=word_order).
+          all: eauto with typeclass_instances.
+        * eapply map_extends_get_not_None. 2: eassumption.
+          eapply @map_take_ge_extends with (p:=word_order).
+          all: eauto with typeclass_instances.
+      + eapply map_min_tuple_key_le; [ eassumption | ]. rewrite <- E.
+        apply map_take_ge_get_not_None'.
+        * eauto using map_take_ge_get_not_None.
+        * apply half_subcontent_get_nNone. eapply map_extends_get_not_None.
+          2: eassumption. eapply @map_take_ge_extends with (p:=word_order).
+          all: eauto with typeclass_instances. } .**/
   }                                                                        /**. .**/
   cbt_get_min_impl(tp, key_out, val_out);                                  /**.
   clear Error. instantiate (3:=c). instantiate (3:=sk).
@@ -4414,8 +4887,9 @@ Derive cbt_next_ge_impl_at_cb SuchThat (fun_correct! cbt_next_ge_impl_at_cb)
                     (cbt_best_lookup sk1 (half_subcontent c false) k) <> None) by steps.
     rewrite half_subcontent_get in Hwrh. steps. }
   steps.
-  { apply map_min_key_value_eq.
+  { apply map_min_tuple_eq.
     - rewrite map_take_ge_get_ge. { eauto with content_maps. }
+      enough (\[k] <= \[k1]). { unfold leb, parameters.ltb. simpl. hwlia. }
       apply bit_at_le with \[cb]; steps.
       + transitivity (bit_at (cbt_best_lookup sk c k) j).
         * apply pfx_meet_emb_bit_at_eq. steps.
@@ -4425,9 +4899,12 @@ Derive cbt_next_ge_impl_at_cb SuchThat (fun_correct! cbt_next_ge_impl_at_cb)
         * apply pfx_le_emb_bit_same_prefix with (pfx_mmeet c); steps.
           apply pfx_mmeet_key_le. steps.
         * destruct (bit_at (cbt_best_lookup sk c k) \[cb]) eqn:E2; steps.
-    - intros k' Hink'. apply_forall. eauto with content_maps. }
+    - intros k' Hink'.
+      enough (\[k1] <= \[k']). { unfold leb, parameters.ltb. simpl. hwlia. }
+      apply_forall. eapply map_extends_get_not_None. 2: eassumption.
+      eapply @map_take_ge_extends with (p:=word_order).
+      all: eauto with typeclass_instances. }
 Qed.
-
 
 #[export] Instance spec_of_cbt_next_ge: fnspec :=                                .**/
 uintptr_t cbt_next_ge(uintptr_t tp, uintptr_t k,
@@ -4446,7 +4923,7 @@ uintptr_t cbt_next_ge(uintptr_t tp, uintptr_t k,
                       * emp (res = /[0]) }>
                  else
                    (EX k_res v_res,
-                     <{ * emp (map_min_key_value (map_take_ge c k) = Some (k_res, v_res))
+                     <{ * emp (map_min_tuple (map_take_ge c k) = Some (k_res, v_res))
                         * uintptr k_res key_out
                         * uintptr v_res val_out
                         * emp (res = /[1]) }>))
@@ -4457,7 +4934,8 @@ Derive cbt_next_ge SuchThat (fun_correct! cbt_next_ge) As cbt_next_ge_ok.       
   if (tp == 0) /* split */ {                                               /**. .**/
     return 0;                                                              /**. .**/
   }                                                                        /**.
-  rewrite map_take_ge_empty. rewrite Decidable_complete by reflexivity. steps. .**/
+  rewrite @map_take_ge_empty with (p:=word_order) by auto.
+  rewrite Decidable_complete by reflexivity. steps. .**/
   else {                                                                   /**. .**/
     uintptr_t orig_in_key_out = load(key_out);                             /**. .**/
     uintptr_t best_k = cbt_best_with_trace(tp, k, key_out, val_out);       /**.
@@ -4471,9 +4949,11 @@ Derive cbt_next_ge SuchThat (fun_correct! cbt_next_ge) As cbt_next_ge_ok.       
       return 1;                                                            /**. .**/
     }                                                                      /**.
   rewrite Decidable_sound_alt; steps.
-  auto using map_min_key_value_take_ge_has_min.
+  auto using map_min_tuple_take_ge_has_min.
   apply map_get_not_None_nonempty with (k:=k).
-  rewrite map_take_ge_get_ge; subst; steps. .**/
+  rewrite @map_take_ge_get_ge with (p:=word_order); auto with typeclass_instances;
+  subst; steps. eapply some_not_none. eassumption.
+  admit. (* TODO: add reflexivity lemma to the section *) .**/
     else {                                                                 /**. .**/
       uintptr_t trace = load(key_out);                                     /**. .**/
       uintptr_t cb = critical_bit(best_k, k);                              /**. .**/
@@ -4597,6 +5077,7 @@ Proof.
   intros. apply map_filter_by_key_all_false. intros. hwlia.
 Qed.
 
+(*
 Lemma map_take_gt_get_gt : forall (c : word_map) (k k' : word),
   \[k] < \[k'] -> map.get (map_take_gt c k) k' = map.get c k'.
 Proof.
@@ -4614,6 +5095,7 @@ Lemma map_take_gt_get_nnone : forall (c : word_map) (k k' : word),
 Proof.
   intros ? ? ? Hnn. apply map_filter_by_key_get_not_None_true in Hnn. lia.
 Qed.
+*)
 
 #[export] Instance spec_of_cbt_next_gt: fnspec :=                                .**/
 uintptr_t cbt_next_gt(uintptr_t tp, uintptr_t k,
@@ -5042,7 +5524,9 @@ Proof.
     eauto using ww_list_sorted_tail. eauto using ww_list_unique_keys_tail.
 Qed.
 
-Definition map_to_sorted_list : word_map -> list (word * word)
+Definition map_to_sorted_list (m : word_map) := tuple m
+ : word_map -> list (word * word)
+
   := map.fold (fun l k v => sorted_word_word_insert (k, v) l) nil.
 
 Lemma map_to_sorted_list_length : forall c,
